@@ -69,6 +69,12 @@ constexpr uint MIC_ADC_GPIO       = 27;
 constexpr uint8_t MIC_ADC_CHANNEL = 1;
 
 // Carrier-Tonhöhenbereich - unverändert.
+// ZURÜCKGESETZT auf 80Hz (siehe DEVLOG Nachtrag 31): die Einengung auf
+// 150/200Hz war eine Reaktion auf Kontamination, die zumindest teilweise
+// durch die (jetzt ebenfalls zurückgesetzte) 400Hz-Envelope-Analyse
+// mitverursacht wurde, nicht nur durch die Carrier-Frequenz selbst.
+// 80Hz war der zuletzt bestätigt funktionierende Wert, direkt nach der
+// DIN-Leitungs-Umverlegung.
 constexpr float kMinCarrierHz = 80.0f;
 constexpr float kMaxCarrierHz = 400.0f;
 
@@ -79,10 +85,12 @@ constexpr uint32_t kSampleRateHz  = 44100;
 constexpr uint32_t kBufferSamples = 256;
 
 // --- Envelope-Follower-Parameter ---
-// Bandpass fokussiert auf den energiereichsten Sprachbereich (grobe
-// Stimmgrundfrequenz + erste Formanten), unterdrückt nebenbei
-// DC-Anteile/Rumpeln - wie schon beim allerersten 1-Band-Test ganz am
-// Anfang des Projekts. Erster Schätzwert, nicht gemessenes Optimum.
+// ZURÜCKGESETZT auf 1000Hz (siehe DEVLOG Nachtrag 31): die Senkung auf
+// 400Hz hat vermutlich ein neues Problem erzeugt, das es vorher nicht
+// gab - bei einem Poti-Bereich von 200-400Hz landet die 2. Harmonische
+// eines Carriers (z.B. 224Hz -> 448Hz) fast direkt im 400Hz-Analyse-
+// fenster, was das DAC->Mic-Übersprechen dort verstärkt durchschlagen
+// lässt. 1000Hz war der zuletzt bestätigt funktionierende Wert.
 constexpr float kEnvelopeFreqHz = 1000.0f;
 constexpr float kEnvelopeQ      = 1.5f;
 constexpr float kAttackMs       = 5.0f;
@@ -189,10 +197,10 @@ q16 g_compEnvelope = 0;
 // --- Noise-Gate mit Hysterese (siehe DEVLOG Nachtrag 19/20/23 für die
 // Herleitung, insbesondere warum Hysterese statt einer einzelnen
 // Schwelle nötig war). Werte ebenfalls neu zu kalibrieren. ---
-constexpr float kGateOpenThreshold  = 0.020f;
-constexpr float kGateCloseThreshold = 0.008f;
+constexpr float kGateOpenThreshold  = 0.050f; // war 0.020 - Messung zeigte Ruhepegel bei 17-24/1000, direkt auf der alten Schwelle -> Geflacker, siehe DEVLOG
+constexpr float kGateCloseThreshold = 0.030f; // war 0.008 - mit Abstand über dem beobachteten Ruhepegel
 constexpr float kGateAttackMs   = 5.0f;
-constexpr float kGateReleaseMs  = 120.0f;
+constexpr float kGateReleaseMs  = 40.0f; // war 120ms - vermutlich Hauptursache für hörbares Nachschwingen nach dem Sprechen, siehe DEVLOG
 
 q16 g_gateOpenThresholdQ16 = 0;
 q16 g_gateCloseThresholdQ16 = 0;
