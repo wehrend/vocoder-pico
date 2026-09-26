@@ -22,28 +22,46 @@
 // Mic-Eingang, Kompressor, Noise-Gate) ist aus dem Vocoder-Projekt
 // schon vorhanden und einzeln bewiesen funktionierend.
 //
-// GESTRICHEN gegenüber der Vocoder-Version (nicht mehr gebraucht):
-// - 12-Band-Filterbank (VocoderBandFixed, vocoder_band_fixed.h)
-// - Zwei-Kern-Aufteilung (Core1/pico_multicore) - bei nur einem
-//   Envelope-Follower ist die Rechenlast trivial, ein Kern reicht
-//   bequem
+// GESTRICHEN gegenüber der ursprünglichen 12-Band-Vocoder-Version
+// (nicht mehr gebraucht) - Stand nach dem Talkbox-Umbau, TEILWEISE
+// durch den 3-Band-Ausbau (Nachtrag 44) wieder relativiert, siehe dort:
+// - 12-Band-Filterbank -> jetzt wieder 3 Bänder (VocoderBandFixed),
+//   aber bewusst nicht gleich wieder 12
+// - Zwei-Kern-Aufteilung (Core1/pico_multicore) - Rechenlast bei 3
+//   Bändern weiterhin trivial genug für einen einzelnen Kern
 // - Stimmhaft/Unstimmhaft-Erkennung + Rauschmischung im Carrier - war
 //   nur nötig, um unstimmhaften Lauten in der SPEKTRALEN Vocoder-
-//   Verarbeitung Energie zu geben; für reine Amplitudenmodulation
-//   irrelevant
+//   Verarbeitung Energie zu geben; für den 3-Band-Zwischenschritt noch
+//   nicht wieder eingeführt (siehe Nachtrag 44)
 // - Pre-Emphasis-Filter (Nachtrag 24-26) - war ein Versuch, den
 //   analogen Bandbreiten-Verlust für die Vocoder-Formant-Erkennung
-//   auszugleichen; hier nicht mehr relevant
+//   auszugleichen; bisher nicht wieder eingeführt
 //
 // BEHALTEN: Oszillator/Poti-Tonhöhe, DC-Tracking im Mic-Read,
 // Kompressor, Noise-Gate (mit Hysterese), FreeRTOS-Grundgerüst
 // (audioTask/controlTask, Priority-Starvation-Fix) - alles bereits
 // einzeln verifiziert funktionierend, siehe DEVLOG.
 //
-// ABNAHMEKRITERIUM für dieses Zwischenziel (siehe DEVLOG): Ton wird
-// beim Sprechen/Singen vor dem Mic hörbar lauter/leiser, bleibt bei
-// Stille sauber still (Gate), verzerrt nicht bei normaler
-// Sprechlautstärke (Kompressor).
+// ABNAHMEKRITERIUM für das Talkbox-Zwischenziel (siehe DEVLOG): Ton
+// wird beim Sprechen/Singen vor dem Mic hörbar lauter/leiser, bleibt
+// bei Stille sauber still (Gate), verzerrt nicht bei normaler
+// Sprechlautstärke (Kompressor). Erreicht und stabil (siehe Nachtrag
+// 40), zunächst im eingegrenzten 180-300Hz-Bereich (Nachtrag 38/39),
+// nach der Sternerdung (Nachtrag 47) über den vollen 80-400Hz-Bereich
+// bestätigt stabil - siehe dort für die eigentliche Ursache
+// (Masseschleife) und ihre Behebung.
+//
+// === NACHTRAG 44: AUSBAU AUF 3 BÄNDER (feature/multiband-vocoder) ===
+// Erster schrittweiser Ausbau Richtung Mehrband-Vocoder, bewusst NICHT
+// gleich auf 12 Bänder gesprungen (Lehre aus Nachtrag 27/34). Statt
+// EINEM Bandpass + EINER Hüllkurve: 3 Bänder, jeweils mit eigenem
+// Analyse-Bandpass (Mic) UND eigenem Synthese-Bandpass (Carrier) -
+// das ist der eigentliche Unterschied zwischen Talkbox (reine
+// Amplitudenmodulation) und Vocoder (spektrale Formung). Wiederverwendet
+// `vocoder_band_fixed.h` unverändert aus dem 12-Band-Projekt. Noch
+// KEINE Stimmhaft/Unstimmhaft-Erkennung, noch kein Ausbau der
+// Bandzahl über 3 hinaus - erst dieser Schritt stabilisieren, dann
+// nach demselben Muster weiter hochskalieren.
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -55,7 +73,7 @@
 #include "hardware/adc.h"
 #include "fixed_point.h"
 #include "biquad_fixed.h"
-#include "envelope_follower.h"
+#include "vocoder_band_fixed.h"
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -82,8 +100,15 @@ constexpr uint8_t MIC_ADC_CHANNEL = 1;
 // Stellungen hinweg). 184Hz und 262-266Hz bestätigt sauber. Die
 // eigentliche elektrische Ursache ist weiterhin nicht gefunden, das
 // hier bleibt ein pragmatisches Eingrenzen, keine Lösung.
-constexpr float kMinCarrierHz = 180.0f;
-constexpr float kMaxCarrierHz = 300.0f;
+// Voller Bereich wiederhergestellt (siehe DEVLOG Nachtrag 47): die
+// Sternerdung hat die eigentliche elektrische Ursache (Masseschleife
+// über den gemeinsamen Steckbrett-GND-Pfad, siehe Nachtrag 42/43)
+// tatsächlich behoben, bestätigt über den kompletten 80-400Hz-Bereich.
+// Die vorherige Eingrenzung auf 180-300Hz (Nachtrag 38/39) war nur ein
+// Software-seitiges Umgehen des Symptoms, keine Lösung - jetzt nicht
+// mehr nötig.
+constexpr float kMinCarrierHz = 80.0f;
+constexpr float kMaxCarrierHz = 400.0f;
 
 // Rechenlast ist jetzt trivial (1 Bandpass statt 12) - volle 44.1kHz
 // sind wieder problemlos drin, kein Grund mehr für die 22.05kHz-
@@ -91,19 +116,25 @@ constexpr float kMaxCarrierHz = 300.0f;
 constexpr uint32_t kSampleRateHz  = 44100;
 constexpr uint32_t kBufferSamples = 256;
 
-// --- Envelope-Follower-Parameter ---
-// ZURÜCKGESETZT auf 1000Hz (siehe DEVLOG Nachtrag 31): die Senkung auf
-// 400Hz hat vermutlich ein neues Problem erzeugt, das es vorher nicht
-// gab - bei einem Poti-Bereich von 200-400Hz landet die 2. Harmonische
-// eines Carriers (z.B. 224Hz -> 448Hz) fast direkt im 400Hz-Analyse-
-// fenster, was das DAC->Mic-Übersprechen dort verstärkt durchschlagen
-// lässt. 1000Hz war der zuletzt bestätigt funktionierende Wert.
-constexpr float kEnvelopeFreqHz = 1000.0f;
-constexpr float kEnvelopeQ      = 1.5f;
-constexpr float kAttackMs       = 5.0f;
-constexpr float kReleaseMs      = 100.0f;
+// --- 3-Band-Filterbank (siehe Nachtrag 44) ---
+// Frequenzbereich bewusst innerhalb dessen gewählt, wo laut Vocoder-
+// Diagnose (Nachtrag 23) noch brauchbar viel Mic-Signalenergie ankommt
+// (Gain-Bandbreite-Kompromiss am MAX4466 lässt oberhalb von grob
+// 1-1.5kHz kaum noch etwas durch). Geometrisch gestaffelt: 150Hz /
+// ~424Hz / 1200Hz. Erster Schätzwert, kein gemessenes Optimum.
+constexpr int kNumBands = 3;
+constexpr float kBandFreqLowHz  = 150.0f;
+constexpr float kBandFreqHighHz = 1200.0f;
+constexpr float kBandQ          = 2.0f;
+// Tiefe Bänder etwas träger (Formanten bewegen sich langsamer), hohe
+// Bänder etwas flinker (Konsonanten/Transienten) - dieselbe Logik wie
+// im 12-Band-Projekt, siehe vocoder_band_fixed.h.
+constexpr float kAttackMsLow    = 8.0f;
+constexpr float kAttackMsHigh   = 3.0f;
+constexpr float kReleaseMsLow   = 120.0f;
+constexpr float kReleaseMsHigh  = 60.0f;
 
-EnvelopeFollower envelopeFollower;
+VocoderBandFixed bands[kNumBands];
 
 // Pulszug-Wavetable für den Carrier (siehe DEVLOG Nachtrag 13 für die
 // Begründung: gleichmäßigeres Obertonspektrum als ein Sägezahn). Hier
@@ -191,15 +222,16 @@ QueueHandle_t g_potRawQueue = nullptr;
 QueueHandle_t g_carrierFreqQueue = nullptr;
 
 // --- Kompressor-Parameter (siehe DEVLOG Nachtrag 12 für die
-// Herleitung) - Werte sind hier NEU zu kalibrieren, da die
-// Signal-Skala ohne 12-fache Bandsummierung anders ist als beim
-// Vocoder. Erster Schätzwert, kein gemessenes Optimum. ---
-constexpr float kCompInputGain  = 2.0f;
+// Herleitung) - Werte sind hier NEU zu kalibrieren: erst für die
+// 1-Band-Talkbox angepasst, jetzt durch die 3-Band-Summierung
+// (Nachtrag 44) wieder eine andere Signal-Skala als beim
+// 12-Band-Vocoder. Erster Schätzwert, kein gemessenes Optimum. ---
+constexpr float kCompInputGain  = 2.0f; // zurückgesetzt (0.8 war falsche Stellschraube - beeinflusst auch die Gate-Erkennung, siehe DEVLOG)
 constexpr float kCompThreshold  = 0.3f;
 constexpr float kCompRatio      = 8.0f;
 constexpr float kCompAttackMs   = 5.0f;
 constexpr float kCompReleaseMs  = 150.0f;
-constexpr float kCompMakeup     = 2.0f;
+constexpr float kCompMakeup     = 2.0f; // zurückgesetzt - 0.8 war nur zum Testen der (widerlegten) Lautstärke-Theorie, siehe DEVLOG Nachtrag 47
 
 q16 g_compInputGainQ16 = 0;
 q16 g_compThresholdQ16 = 0;
@@ -258,7 +290,9 @@ void controlTask(void *) {
 
 void audioTask(void *) {
     build_carrier_table();
-    envelopeFollower.init(kEnvelopeFreqHz, kEnvelopeQ, kAttackMs, kReleaseMs, (float)kSampleRateHz);
+    init_vocoder_bands_fixed(bands, kNumBands, kBandFreqLowHz, kBandFreqHighHz,
+                              kBandQ, kAttackMsLow, kAttackMsHigh,
+                              kReleaseMsLow, kReleaseMsHigh, (float)kSampleRateHz);
     g_micDcUpdateRate = kQ16One - float_to_q16(expf(-1.0f / (0.001f * kMicDcTrackingMs * (float)kSampleRateHz)));
 
     g_compInputGainQ16 = float_to_q16(kCompInputGain);
@@ -295,7 +329,13 @@ void audioTask(void *) {
     static uint32_t sWaitMaxUs = 0;
     static q16 sMicMinQ16 = kQ16One;
     static q16 sMicMaxQ16 = -kQ16One;
-    static q16 sEnvMaxQ16 = 0;
+    // Drei einzelne Band-Hüllkurven statt einer aggregierten - hat sich
+    // im 12-Band-Projekt (dortiger Nachtrag 22/23) als der Diagnose-
+    // Wert herausgestellt, der tatsächlich zeigt, ob die Bänder
+    // spektral differenzieren, statt nur die Gesamtlautstärke.
+    static q16 sBand0MaxQ16 = 0;
+    static q16 sBand1MaxQ16 = 0;
+    static q16 sBand2MaxQ16 = 0;
     static int sLastPotPermille = 0;
     static int sLastCarrierHzInt = 0;
     static int sLastGateEnvPermille = 0;
@@ -331,11 +371,15 @@ void audioTask(void *) {
             if (micQ16 < sMicMinQ16) sMicMinQ16 = micQ16;
             if (micQ16 > sMicMaxQ16) sMicMaxQ16 = micQ16;
 
-            q16 env = envelopeFollower.process(micQ16);
-            if (env > sEnvMaxQ16) sEnvMaxQ16 = env;
-
             q16 carrierQ16 = carrierTable[(phase >> 16) & (kCarrierTableSize - 1)];
-            q16 mixed = q16_mul(carrierQ16, env);
+            q16 mixed = 0;
+            for (int b = 0; b < kNumBands; ++b) {
+                bands[b].analyze(micQ16);
+                mixed += bands[b].synthesize(carrierQ16);
+            }
+            if (bands[0].envelope > sBand0MaxQ16) sBand0MaxQ16 = bands[0].envelope;
+            if (bands[1].envelope > sBand1MaxQ16) sBand1MaxQ16 = bands[1].envelope;
+            if (bands[2].envelope > sBand2MaxQ16) sBand2MaxQ16 = bands[2].envelope;
 
             // Level -> Kompressor -> Makeup statt hartem Clipping.
             mixed = q16_mul(mixed, g_compInputGainQ16);
@@ -393,14 +437,17 @@ void audioTask(void *) {
         if (++sBufferCount >= 100) {
             int micMinPermille = (int)(((int64_t)sMicMinQ16 * 1000) / kQ16One);
             int micMaxPermille = (int)(((int64_t)sMicMaxQ16 * 1000) / kQ16One);
-            int envMaxPermille = (int)(((int64_t)sEnvMaxQ16 * 1000) / kQ16One);
-            printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 envMax=%d/1000 gateEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
+            int band0Permille = (int)(((int64_t)sBand0MaxQ16 * 1000) / kQ16One);
+            int band1Permille = (int)(((int64_t)sBand1MaxQ16 * 1000) / kQ16One);
+            int band2Permille = (int)(((int64_t)sBand2MaxQ16 * 1000) / kQ16One);
+            printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 band0=%d/1000 band1=%d/1000 band2=%d/1000 gateEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
                    __DATE__, __TIME__,
                    (unsigned long)(sSumUs / sBufferCount), (unsigned long)sMaxUs,
                    (unsigned long)(sWaitSumUs / sBufferCount), (unsigned long)sWaitMaxUs,
                    (unsigned long)kBufferBudgetUs,
                    sLastPotPermille, sLastCarrierHzInt, micMinPermille, micMaxPermille,
-                   sLastMicDcPermille, envMaxPermille, sLastGateEnvPermille, sLastGateGainPermille);
+                   sLastMicDcPermille, band0Permille, band1Permille, band2Permille,
+                   sLastGateEnvPermille, sLastGateGainPermille);
             sBufferCount = 0;
             sSumUs = 0;
             sMaxUs = 0;
@@ -408,7 +455,9 @@ void audioTask(void *) {
             sWaitMaxUs = 0;
             sMicMinQ16 = kQ16One;
             sMicMaxQ16 = -kQ16One;
-            sEnvMaxQ16 = 0;
+            sBand0MaxQ16 = 0;
+            sBand1MaxQ16 = 0;
+            sBand2MaxQ16 = 0;
         }
 
         // WICHTIG - PRIORITY-STARVATION-FIX (siehe DEVLOG Nachtrag 8):
@@ -441,7 +490,7 @@ int main() {
         panic("Queue-Erstellung fehlgeschlagen (Heap zu klein?)");
     }
 
-    // Rechenlast ist jetzt trivial (1 Envelope-Follower statt 12-Band-
+    // Rechenlast mit 3 Bändern weiterhin gering genug (statt 12-Band-
     // Filterbank) - ein einzelner Task auf Core0 reicht bequem, kein
     // Core1 mehr nötig.
     xTaskCreate(audioTask, "audio", 1024, nullptr, /*priority=*/3, nullptr);
