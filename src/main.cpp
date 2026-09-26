@@ -284,6 +284,15 @@ void audioTask(void *) {
     static uint32_t sBufferCount = 0;
     static uint64_t sSumUs = 0;
     static uint32_t sMaxUs = 0;
+    // NEU: I2S-Pufferwartezeit (take_audio_buffer) separat von der
+    // reinen Sample-Verarbeitung gemessen - bisher war das in der
+    // Diagnose gar nicht sichtbar. Soll klären, ob die beobachtete
+    // Timing-Anomalie während der Rückkopplungs-Episoden aus dem
+    // Warten auf den I2S-Puffer kommt (würde auf gestörte I2S-Taktung
+    // hindeuten) oder aus der Sample-Schleife selbst (eher auf
+    // Interrupt-Unterbrechungen hindeutend), siehe DEVLOG.
+    static uint64_t sWaitSumUs = 0;
+    static uint32_t sWaitMaxUs = 0;
     static q16 sMicMinQ16 = kQ16One;
     static q16 sMicMaxQ16 = -kQ16One;
     static q16 sEnvMaxQ16 = 0;
@@ -291,6 +300,11 @@ void audioTask(void *) {
     static int sLastCarrierHzInt = 0;
     static int sLastGateEnvPermille = 0;
     static int sLastGateGainPermille = 0;
+    // NEU: zeigt den nachverfolgten Gleichspannungs-Arbeitspunkt des
+    // Mic-Eingangs (g_micDcState) an - soll klären, ob sich der
+    // Arbeitspunkt während einer Rückkopplungs-Episode verschiebt,
+    // ohne dass dafür live am laufenden Gerät gemessen werden muss.
+    static int sLastMicDcPermille = 0;
 
     for (;;) {
         adc_select_input(POT_ADC_CHANNEL);
@@ -301,7 +315,11 @@ void audioTask(void *) {
 
         adc_select_input(MIC_ADC_CHANNEL);
 
+        uint64_t waitStartUs = time_us_64();
         audio_buffer_t *buf = take_audio_buffer(pool, true);
+        uint64_t waitUs = time_us_64() - waitStartUs;
+        sWaitSumUs += waitUs;
+        if ((uint32_t)waitUs > sWaitMaxUs) sWaitMaxUs = (uint32_t)waitUs;
         int16_t *samples = (int16_t *)buf->buffer->bytes;
 
         sLastPotPermille = (int)(potNorm * 1000.0f);
@@ -370,20 +388,24 @@ void audioTask(void *) {
         if ((uint32_t)elapsedUs > sMaxUs) sMaxUs = (uint32_t)elapsedUs;
         sLastGateEnvPermille = (int)(((int64_t)g_compEnvelope * 1000) / kQ16One);
         sLastGateGainPermille = (int)(((int64_t)g_gateGain * 1000) / kQ16One);
+        sLastMicDcPermille = (int)(((int64_t)g_micDcState * 1000) / kQ16One);
 
         if (++sBufferCount >= 100) {
             int micMinPermille = (int)(((int64_t)sMicMinQ16 * 1000) / kQ16One);
             int micMaxPermille = (int)(((int64_t)sMicMaxQ16 * 1000) / kQ16One);
             int envMaxPermille = (int)(((int64_t)sEnvMaxQ16 * 1000) / kQ16One);
-            printf("Diagnose[%s %s]: avg=%luus max=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 envMax=%d/1000 gateEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
+            printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 envMax=%d/1000 gateEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
                    __DATE__, __TIME__,
                    (unsigned long)(sSumUs / sBufferCount), (unsigned long)sMaxUs,
+                   (unsigned long)(sWaitSumUs / sBufferCount), (unsigned long)sWaitMaxUs,
                    (unsigned long)kBufferBudgetUs,
                    sLastPotPermille, sLastCarrierHzInt, micMinPermille, micMaxPermille,
-                   envMaxPermille, sLastGateEnvPermille, sLastGateGainPermille);
+                   sLastMicDcPermille, envMaxPermille, sLastGateEnvPermille, sLastGateGainPermille);
             sBufferCount = 0;
             sSumUs = 0;
             sMaxUs = 0;
+            sWaitSumUs = 0;
+            sWaitMaxUs = 0;
             sMicMinQ16 = kQ16One;
             sMicMaxQ16 = -kQ16One;
             sEnvMaxQ16 = 0;

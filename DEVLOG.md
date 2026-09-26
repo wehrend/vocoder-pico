@@ -17,13 +17,13 @@ herausgeführt - deswegen sind sie im normalen (Header-)Pinout-Tool
 nicht zu finden. Quelle: `DatanoiseTV/PicoADK-Hardware`-Repo, Abschnitt
 "Internal Signals".
 
-| GPIO | Funktion                              |
-| ---- | ------------------------------------- |
-| 16   | PCM5100A I2S **DAT**                  |
-| 17   | PCM5100A I2S **BCLK**                 |
-| 18   | PCM5100A I2S **LRCLK**                |
-| 23   | PCM5100A **DEMP** (Deemphase 44.1kHz) |
-| 25   | PCM5100A **XSMT** (Mute/Unmute)       |
+| GPIO | Funktion |
+|------|----------|
+| 16 | PCM5100A I2S **DAT** |
+| 17 | PCM5100A I2S **BCLK** |
+| 18 | PCM5100A I2S **LRCLK** |
+| 23 | PCM5100A **DEMP** (Deemphase 44.1kHz) |
+| 25 | PCM5100A **XSMT** (Mute/Unmute) |
 
 ### Stolperfalle 1: XSMT ist standardmäßig stumm geschaltet
 
@@ -232,13 +232,12 @@ Ursache, nicht auf einen Build-Fehler.**
 ## Fix: Q16.16 Fixed-Point statt float im Sample-Hot-Path
 
 Neue Dateien `fixed_point.h`, `biquad_fixed.h`, `vocoder_band_fixed.h`
-
 - Q16.16 (32-Bit signed, 16 Integer-/16 Nachkommabits) statt float für
-  alles, was pro Sample läuft (Biquad-Verarbeitung, Gleichrichtung,
-  Attack/Release, Mic-Read, Carrier-Wavetable, Ausgangs-Skalierung).
-  Ganzzahl-Multiplikation ist auf dem M0+ (Hardware-MUL, 1 Takt für die
-  unteren 32 Bit) um ein Vielfaches billiger als eine
-  IEEE754-Software-Multiplikation.
+alles, was pro Sample läuft (Biquad-Verarbeitung, Gleichrichtung,
+Attack/Release, Mic-Read, Carrier-Wavetable, Ausgangs-Skalierung).
+Ganzzahl-Multiplikation ist auf dem M0+ (Hardware-MUL, 1 Takt für die
+unteren 32 Bit) um ein Vielfaches billiger als eine
+IEEE754-Software-Multiplikation.
 
 Float bleibt bewusst dort, wo es nicht im Hot Path liegt: die
 trigonometrischen Berechnungen in `setBandpass()` (`sinf`/`cosf`) und
@@ -855,7 +854,6 @@ erste Verdächtige.
 
 Bauen/flashen - das ist die bisher größte strukturelle Änderung seit
 dem FreeRTOS-Umbau selbst, also besonders sorgfältig prüfen:
-
 1. Startet die Firmware überhaupt (siehe Risiko oben)?
 2. `bands=` in der Diagnose - liegt es spürbar unter den vorherigen
    Einzelkern-Werten? Das bestätigt, dass die Parallelisierung
@@ -879,7 +877,6 @@ unverifizierte Risiko aus Nachtrag 14 (`multicore_launch_core1()` vor
 echten Bug in der Stimmhaft/Unstimmhaft-Erkennung** - aber einen
 harmloseren als befürchtet. Neue Diagnose-Felder `vuLow=`/`vuHigh=`
 (rohe, ungefilterte Hüllkurvenwerte) zeigten:
-
 - "aaaa": `vuHigh`/`vuLow`-Verhältnis ~4% (z.B. 1/19, 4/102, 1/27)
 - "sssss": `vuHigh`/`vuLow`-Verhältnis ~19%, teils bis 26% (z.B. 7/27, 8/31)
 
