@@ -75,8 +75,15 @@ constexpr uint8_t MIC_ADC_CHANNEL = 1;
 // mitverursacht wurde, nicht nur durch die Carrier-Frequenz selbst.
 // 80Hz war der zuletzt bestätigt funktionierende Wert, direkt nach der
 // DIN-Leitungs-Umverlegung.
-constexpr float kMinCarrierHz = 80.0f;
-constexpr float kMaxCarrierHz = 400.0f;
+// Auf die bestätigt sichere Mitte eingegrenzt (war 80-400Hz, dann
+// 180-380Hz) - siehe DEVLOG Nachtrag 38/39: 380Hz war immer noch zu
+// nah am oberen Problembereich (355-379Hz zeigte anhaltendes
+// Hängenbleiben, teils über mehrere Sekunden und mehrere Poti-
+// Stellungen hinweg). 184Hz und 262-266Hz bestätigt sauber. Die
+// eigentliche elektrische Ursache ist weiterhin nicht gefunden, das
+// hier bleibt ein pragmatisches Eingrenzen, keine Lösung.
+constexpr float kMinCarrierHz = 180.0f;
+constexpr float kMaxCarrierHz = 300.0f;
 
 // Rechenlast ist jetzt trivial (1 Bandpass statt 12) - volle 44.1kHz
 // sind wieder problemlos drin, kein Grund mehr für die 22.05kHz-
@@ -106,7 +113,15 @@ constexpr int kCarrierTableSize = 512;
 q16 carrierTable[kCarrierTableSize];
 
 void build_carrier_table() {
-    constexpr float kDutyCycle = 0.2f;
+    // 50% statt der ursprünglichen 20% (die waren fürs breitbandige
+    // Obertonspektrum des 12-Band-Vocoders gedacht, siehe Nachtrag 13 -
+    // für die Talkbox nicht mehr nötig). Ein Rechtecksignal hat von
+    // Natur aus weniger hochfrequente Energie als ein schmaler
+    // Pulszug - löst das "unangenehm schrill bei hohen Tonhöhen"-
+    // Problem an der Quelle, statt nachträglich zu filtern (siehe
+    // DEVLOG Nachtrag 36 - der Ausgangs-Tiefpass hatte einen
+    // unerklärten Nebeneffekt auf die Gate-Rückkopplung).
+    constexpr float kDutyCycle = 0.5f;
     for (int i = 0; i < kCarrierTableSize; ++i) {
         float phase = (float)i / (float)kCarrierTableSize;
         float pulse = (phase < kDutyCycle) ? 1.0f : -1.0f;
@@ -209,6 +224,25 @@ q16 g_gateReleaseCoeff = 0;
 q16 g_gateGain = 0;
 bool g_gateIsOpen = false;
 
+// Digitales Tiefpassfilter direkt am Ausgang, NACH Gate/Kompressor,
+// VOR der int16-Wandlung - dämpft die scharfen oberen Harmonischen
+// des schmalen Pulszug-Carriers (20% Duty-Cycle), die bei hohen
+// Tonhöhen (nahe kMaxCarrierHz) als unangenehm hochfrequent/schrill
+// auffielen (siehe DEVLOG). Bewusst SOFTWARE statt einer zusätzlichen
+// Schaltung - reines Klangformungs-Problem, keine Rückwirkung auf die
+// erst kürzlich stabilisierte Mic-/Gate-/Kompressor-Kette, und ohne
+// das Risiko eines weiteren wackligen Steckbrett-Bauteils.
+// kOutputLowpassFreqHz ist ein erster Schätzwert (dämpft grob ab dem
+// Bereich, wo das Ohr am empfindlichsten auf "schrill" reagiert),
+// kein gemessenes/gehörtes Optimum - nach Gehör nachjustieren.
+constexpr float kOutputLowpassFreqHz = 3000.0f;
+// DIAGNOSE-SCHALTER: false = Tiefpass komplett umgehen, um zu testen,
+// ob er die Ursache für das beobachtete "Gate bleibt hängen" ist
+// (Verdacht auf verstärkte DAC->Mic-Rückkopplung, siehe DEVLOG).
+constexpr bool kOutputLowpassEnabled = false;
+q16 g_outputLowpassCoeff = 0;
+q16 g_outputLowpassState = 0;
+
 void controlTask(void *) {
     float smoothedHz = 220.0f;
     for (;;) {
@@ -237,6 +271,7 @@ void audioTask(void *) {
     g_gateCloseThresholdQ16 = float_to_q16(kGateCloseThreshold);
     g_gateAttackCoeff = float_to_q16(expf(-1.0f / (0.001f * kGateAttackMs * (float)kSampleRateHz)));
     g_gateReleaseCoeff = float_to_q16(expf(-1.0f / (0.001f * kGateReleaseMs * (float)kSampleRateHz)));
+    g_outputLowpassCoeff = float_to_q16(1.0f - expf(-2.0f * (float)M_PI * kOutputLowpassFreqHz / (float)kSampleRateHz));
 
     audio_buffer_pool_t *pool = setup_audio();
     setup_adc();
@@ -306,6 +341,14 @@ void audioTask(void *) {
             q16 gateCoeff = (gateTarget > g_gateGain) ? g_gateAttackCoeff : g_gateReleaseCoeff;
             g_gateGain = g_gateGain + q16_mul(kQ16One - gateCoeff, gateTarget - g_gateGain);
             mixed = q16_mul(mixed, g_gateGain);
+
+            // Ausgangs-Tiefpass gegen die scharfen Carrier-Obertöne
+            // bei hohen Tonhöhen, siehe Erklärung oben.
+            if (kOutputLowpassEnabled) {
+                g_outputLowpassState = g_outputLowpassState +
+                    q16_mul(g_outputLowpassCoeff, mixed - g_outputLowpassState);
+                mixed = g_outputLowpassState;
+            }
 
             if (mixed > kQ16One) mixed = kQ16One;
             if (mixed < -kQ16One) mixed = -kQ16One;
