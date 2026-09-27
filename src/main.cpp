@@ -160,7 +160,13 @@ VocoderBandFixed bands[kNumBands];
 // Bändern im Summensignal akustisch unter. Werte grob am beobachteten
 // ~5x-Gefälle über 6 Bänder kalibriert - erster Schätzwert, kein
 // gemessenes Optimum.
-constexpr float kBandOutputGain[kNumBands] = {1.0f, 1.4f, 2.0f, 2.7f, 3.7f, 5.0f};
+// TESTWEISE neutralisiert (war {1.0, 1.4, 2.0, 2.7, 3.7, 5.0}), siehe
+// DEVLOG Nachtrag 56: kalibriert für die ANALYSE-Seite (Sprache hat
+// natürlich mehr tieffrequente Energie), passt aber vermutlich nicht
+// zur SYNTHESE-Seite jetzt mit Rauschmix (recht gleichmäßige Energie
+// übers Spektrum) - erst den Rauschmix isoliert prüfen, dann ggf.
+// neu gewichten.
+constexpr float kBandOutputGain[kNumBands] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
 q16 g_bandOutputGainQ16[kNumBands];
 
 // DIAGNOSE-SCHALTER: -1 = normaler Mix aller Bänder. 0..kNumBands-1 =
@@ -196,6 +202,19 @@ inline q16 next_noise_q16() {
 // Schritt) - erstmal ein fester Mix, um die Grundidee zu testen.
 constexpr float kCarrierNoiseMix = 0.4f;
 q16 g_carrierNoiseMixQ16 = 0;
+
+// "Rosa" statt weißes Rauschen - siehe DEVLOG Nachtrag 56: weißes
+// Rauschen hat gleiche Energie pro Hertz, aber unsere Bänder haben
+// alle dasselbe Q -> höhere Bänder haben eine breitere absolute
+// Bandbreite und fangen dadurch systematisch mehr vom weißen Rauschen
+// ein, unabhängig von der Stimme (Band 5 wurde dadurch viel lauter
+// als Band 0). Ein einfacher Tiefpass vor der Beimischung gibt dem
+// Rauschen mehr Energie pro Oktave statt pro Hertz - passt zur
+// konstanten-Q-Bandaufteilung. Grenzfrequenz grob in der Mitte des
+// Bandbereichs, erster Schätzwert.
+constexpr float kNoiseShapeFreqHz = 400.0f;
+q16 g_noiseShapeCoeff = 0;
+q16 g_noiseShapeState = 0;
 
 void build_carrier_table() {
     // 50% statt der ursprünglichen 20% (die waren fürs breitbandige
@@ -367,6 +386,7 @@ void audioTask(void *) {
         bands[b].synthesisFilter.setBandpass(freq, kSynthesisQ, (float)kSampleRateHz);
     }
     g_carrierNoiseMixQ16 = float_to_q16(kCarrierNoiseMix);
+    g_noiseShapeCoeff = float_to_q16(1.0f - expf(-2.0f * (float)M_PI * kNoiseShapeFreqHz / (float)kSampleRateHz));
     for (int b = 0; b < kNumBands; ++b) {
         g_bandOutputGainQ16[b] = float_to_q16(kBandOutputGain[b]);
     }
@@ -452,7 +472,8 @@ void audioTask(void *) {
 
             q16 carrierQ16 = carrierTable[(phase >> 16) & (kCarrierTableSize - 1)];
             q16 noiseQ16 = next_noise_q16();
-            q16 synthCarrierQ16 = carrierQ16 + q16_mul(g_carrierNoiseMixQ16, noiseQ16 - carrierQ16);
+            g_noiseShapeState = g_noiseShapeState + q16_mul(g_noiseShapeCoeff, noiseQ16 - g_noiseShapeState);
+            q16 synthCarrierQ16 = carrierQ16 + q16_mul(g_carrierNoiseMixQ16, g_noiseShapeState - carrierQ16);
             q16 mixed = 0;
             for (int b = 0; b < kNumBands; ++b) {
                 bands[b].analyze(micQ16);
