@@ -113,7 +113,13 @@ constexpr float kMaxCarrierHz = 400.0f;
 // Rechenlast ist jetzt trivial (1 Bandpass statt 12) - volle 44.1kHz
 // sind wieder problemlos drin, kein Grund mehr für die 22.05kHz-
 // Absenkung aus der Vocoder-Serie.
-constexpr uint32_t kSampleRateHz  = 44100;
+// Von 44.1kHz auf 22.05kHz gesenkt (siehe DEVLOG Nachtrag 50) - 6
+// Bänder (je Analyse+Synthese) überschreiten bei voller Samplerate das
+// CPU-Budget (avg=6400-6700us gegen budget=5804us) - exakt dasselbe
+// Muster, das beim ursprünglichen 12-Band-Projekt zur selben Maßnahme
+// führte. Höchstes Band liegt bei 2000Hz, Nyquist bei 22.05kHz bleibt
+// bei 11kHz - kein Informationsverlust.
+constexpr uint32_t kSampleRateHz  = 22050;
 constexpr uint32_t kBufferSamples = 256;
 
 // --- 3-Band-Filterbank (siehe Nachtrag 44) ---
@@ -122,9 +128,9 @@ constexpr uint32_t kBufferSamples = 256;
 // (Gain-Bandbreite-Kompromiss am MAX4466 lässt oberhalb von grob
 // 1-1.5kHz kaum noch etwas durch). Geometrisch gestaffelt: 150Hz /
 // ~424Hz / 1200Hz. Erster Schätzwert, kein gemessenes Optimum.
-constexpr int kNumBands = 3;
+constexpr int kNumBands = 6;
 constexpr float kBandFreqLowHz  = 150.0f;
-constexpr float kBandFreqHighHz = 1200.0f;
+constexpr float kBandFreqHighHz = 2000.0f; // war 1200Hz - jetzt genutzt: bessere Mic-Bandbreite nach dem 12k/12k-Teiler-Umbau (siehe DEVLOG)
 constexpr float kBandQ          = 2.0f;
 // Tiefe Bänder etwas träger (Formanten bewegen sich langsamer), hohe
 // Bänder etwas flinker (Konsonanten/Transienten) - dieselbe Logik wie
@@ -200,6 +206,16 @@ float read_adc_normalized() {
     uint16_t raw = adc_read();
     return (float)raw / 4095.0f;
 }
+
+// Umkehr-Schalter für den Fall, dass das Poti physisch andersherum
+// verkabelt ist als die Software erwartet (siehe DEVLOG - `pot=`
+// blieb bei zwei Tests trotz Drehens am selben Anschlag auf ~1000
+// hängen, noch nicht abschließend bestätigt, ob das an der
+// Verkabelung lag oder schlicht zweimal derselbe Anschlag getroffen
+// wurde). Auf true stellen, falls sich am tiefen Poti-Anschlag
+// weiterhin `pot=` nahe 1000 statt nahe 0 zeigt - kein Kabel-Umbau
+// nötig, einfach hier umschalten.
+constexpr bool kInvertPot = false;
 
 // Dynamisch nachverfolgter Gleichspannungs-Anteil des Mic-Signals,
 // statt eines hart codierten angenommenen Mittelpunkts - siehe DEVLOG
@@ -333,9 +349,10 @@ void audioTask(void *) {
     // im 12-Band-Projekt (dortiger Nachtrag 22/23) als der Diagnose-
     // Wert herausgestellt, der tatsächlich zeigt, ob die Bänder
     // spektral differenzieren, statt nur die Gesamtlautstärke.
-    static q16 sBand0MaxQ16 = 0;
-    static q16 sBand1MaxQ16 = 0;
-    static q16 sBand2MaxQ16 = 0;
+    // Array statt fester Einzelvariablen - wächst automatisch mit
+    // kNumBands mit, kein Handeintrag mehr nötig beim nächsten
+    // Hochskalieren (siehe DEVLOG).
+    static q16 sBandMaxQ16[kNumBands] = {};
     static int sLastPotPermille = 0;
     static int sLastCarrierHzInt = 0;
     static int sLastGateEnvPermille = 0;
@@ -349,6 +366,7 @@ void audioTask(void *) {
     for (;;) {
         adc_select_input(POT_ADC_CHANNEL);
         float potNorm = read_adc_normalized();
+        if (kInvertPot) potNorm = 1.0f - potNorm;
         xQueueOverwrite(g_potRawQueue, &potNorm);
         xQueueReceive(g_carrierFreqQueue, &carrierHz, 0);
         uint32_t phaseInc = (uint32_t)((carrierHz * kCarrierTableSize / (float)kSampleRateHz) * 65536.0f);
@@ -377,9 +395,9 @@ void audioTask(void *) {
                 bands[b].analyze(micQ16);
                 mixed += bands[b].synthesize(carrierQ16);
             }
-            if (bands[0].envelope > sBand0MaxQ16) sBand0MaxQ16 = bands[0].envelope;
-            if (bands[1].envelope > sBand1MaxQ16) sBand1MaxQ16 = bands[1].envelope;
-            if (bands[2].envelope > sBand2MaxQ16) sBand2MaxQ16 = bands[2].envelope;
+            for (int b = 0; b < kNumBands; ++b) {
+                if (bands[b].envelope > sBandMaxQ16[b]) sBandMaxQ16[b] = bands[b].envelope;
+            }
 
             // Level -> Kompressor -> Makeup statt hartem Clipping.
             mixed = q16_mul(mixed, g_compInputGainQ16);
@@ -437,17 +455,22 @@ void audioTask(void *) {
         if (++sBufferCount >= 100) {
             int micMinPermille = (int)(((int64_t)sMicMinQ16 * 1000) / kQ16One);
             int micMaxPermille = (int)(((int64_t)sMicMaxQ16 * 1000) / kQ16One);
-            int band0Permille = (int)(((int64_t)sBand0MaxQ16 * 1000) / kQ16One);
-            int band1Permille = (int)(((int64_t)sBand1MaxQ16 * 1000) / kQ16One);
-            int band2Permille = (int)(((int64_t)sBand2MaxQ16 * 1000) / kQ16One);
-            printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 band0=%d/1000 band1=%d/1000 band2=%d/1000 gateEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
+            printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 gateEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
                    __DATE__, __TIME__,
                    (unsigned long)(sSumUs / sBufferCount), (unsigned long)sMaxUs,
                    (unsigned long)(sWaitSumUs / sBufferCount), (unsigned long)sWaitMaxUs,
                    (unsigned long)kBufferBudgetUs,
                    sLastPotPermille, sLastCarrierHzInt, micMinPermille, micMaxPermille,
-                   sLastMicDcPermille, band0Permille, band1Permille, band2Permille,
-                   sLastGateEnvPermille, sLastGateGainPermille);
+                   sLastMicDcPermille, sLastGateEnvPermille, sLastGateGainPermille);
+            // Separate Zeile für die Band-Hüllkurven - Anzahl folgt
+            // automatisch kNumBands, kein Umschreiben mehr nötig beim
+            // nächsten Hochskalieren.
+            printf("  bands[0..%d]=", kNumBands - 1);
+            for (int b = 0; b < kNumBands; ++b) {
+                int bandPermille = (int)(((int64_t)sBandMaxQ16[b] * 1000) / kQ16One);
+                printf("%d ", bandPermille);
+            }
+            printf("\n");
             sBufferCount = 0;
             sSumUs = 0;
             sMaxUs = 0;
@@ -455,9 +478,7 @@ void audioTask(void *) {
             sWaitMaxUs = 0;
             sMicMinQ16 = kQ16One;
             sMicMaxQ16 = -kQ16One;
-            sBand0MaxQ16 = 0;
-            sBand1MaxQ16 = 0;
-            sBand2MaxQ16 = 0;
+            for (int b = 0; b < kNumBands; ++b) sBandMaxQ16[b] = 0;
         }
 
         // WICHTIG - PRIORITY-STARVATION-FIX (siehe DEVLOG Nachtrag 8):
