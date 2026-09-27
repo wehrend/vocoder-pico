@@ -177,6 +177,26 @@ constexpr int kSoloBand = -1;
 constexpr int kCarrierTableSize = 512;
 q16 carrierTable[kCarrierTableSize];
 
+// Einfacher Pseudozufalls-Rauschgenerator (linearer Kongruenzgenerator)
+// für die Rauschbeimischung in den Carrier - siehe DEVLOG Nachtrag 55.
+uint32_t g_noiseState = 12345;
+inline q16 next_noise_q16() {
+    g_noiseState = g_noiseState * 1664525u + 1013904223u;
+    int32_t raw = (int32_t)(g_noiseState >> 8); // obere 24 Bit, gleichmäßiger verteilt
+    return (raw & (kQ16One - 1)) - (kQ16One >> 1); // grob auf [-0.5, 0.5) skaliert
+}
+
+// Fester Rauschanteil im Carrier - siehe DEVLOG Nachtrag 55: ein rein
+// periodischer Carrier hat nur diskrete, lückenhafte Obertöne, die je
+// nach Tonhöhe zufällig ein Synthese-Fenster treffen oder verfehlen,
+// UNABHÄNGIG vom Sprachinhalt. Rauschen liefert kontinuierliche,
+// lückenlose Energie über das ganze Spektrum - jedes Band bekommt
+// garantiert echte, unterscheidbare Substanz zum Formen. Noch KEINE
+// Stimmhaft/Unstimmhaft-Umschaltung (das wäre der nächste, feinere
+// Schritt) - erstmal ein fester Mix, um die Grundidee zu testen.
+constexpr float kCarrierNoiseMix = 0.4f;
+q16 g_carrierNoiseMixQ16 = 0;
+
 void build_carrier_table() {
     // 50% statt der ursprünglichen 20% (die waren fürs breitbandige
     // Obertonspektrum des 12-Band-Vocoders gedacht, siehe Nachtrag 13 -
@@ -346,6 +366,7 @@ void audioTask(void *) {
         float freq = kBandFreqLowHz * powf(kBandFreqHighHz / kBandFreqLowHz, t);
         bands[b].synthesisFilter.setBandpass(freq, kSynthesisQ, (float)kSampleRateHz);
     }
+    g_carrierNoiseMixQ16 = float_to_q16(kCarrierNoiseMix);
     for (int b = 0; b < kNumBands; ++b) {
         g_bandOutputGainQ16[b] = float_to_q16(kBandOutputGain[b]);
     }
@@ -430,11 +451,13 @@ void audioTask(void *) {
             if (micQ16 > sMicMaxQ16) sMicMaxQ16 = micQ16;
 
             q16 carrierQ16 = carrierTable[(phase >> 16) & (kCarrierTableSize - 1)];
+            q16 noiseQ16 = next_noise_q16();
+            q16 synthCarrierQ16 = carrierQ16 + q16_mul(g_carrierNoiseMixQ16, noiseQ16 - carrierQ16);
             q16 mixed = 0;
             for (int b = 0; b < kNumBands; ++b) {
                 bands[b].analyze(micQ16);
                 if (kSoloBand < 0 || kSoloBand == b) {
-                    mixed += q16_mul(bands[b].synthesize(carrierQ16), g_bandOutputGainQ16[b]);
+                    mixed += q16_mul(bands[b].synthesize(synthCarrierQ16), g_bandOutputGainQ16[b]);
                 }
             }
             for (int b = 0; b < kNumBands; ++b) {
