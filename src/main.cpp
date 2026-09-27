@@ -131,7 +131,15 @@ constexpr uint32_t kBufferSamples = 256;
 constexpr int kNumBands = 6;
 constexpr float kBandFreqLowHz  = 150.0f;
 constexpr float kBandFreqHighHz = 2000.0f; // war 1200Hz - jetzt genutzt: bessere Mic-Bandbreite nach dem 12k/12k-Teiler-Umbau (siehe DEVLOG)
-constexpr float kBandQ          = 2.0f;
+constexpr float kBandQ          = 5.0f; // Analyse-Q - schmal für gute Formant-Trennung
+// Synthese-Q bewusst SEPARAT und viel breiter als das Analyse-Q
+// (siehe DEVLOG Nachtrag 54): bei Q=5 trifft der Carrier (bzw. seine
+// diskreten Obertöne) das schmale Synthese-Fenster eines Bands nur
+// zufällig - je nach exakter Tonhöhe bekommt ein Band mal viel, mal
+// fast keine Carrier-Energie zum Formen, UNABHÄNGIG vom Sprachinhalt.
+// Ein breiteres Synthese-Fenster garantiert verlässlich Energie in
+// jedem Band, während die Analyse weiterhin scharf trennt.
+constexpr float kSynthesisQ     = 1.2f;
 // Tiefe Bänder etwas träger (Formanten bewegen sich langsamer), hohe
 // Bänder etwas flinker (Konsonanten/Transienten) - dieselbe Logik wie
 // im 12-Band-Projekt, siehe vocoder_band_fixed.h.
@@ -141,6 +149,26 @@ constexpr float kReleaseMsLow   = 120.0f;
 constexpr float kReleaseMsHigh  = 60.0f;
 
 VocoderBandFixed bands[kNumBands];
+
+// Ausgangsseitige Gewichtung pro Band, NACH der Synthese, VOR der
+// Summierung - kompensiert den natürlichen Spektralabfall menschlicher
+// Sprache (Stimmquelle fällt mit steigender Frequenz stark ab,
+// unabhängig vom Vokal). Ohne das dominiert Band 0 die Summe um
+// Faktor ~5 gegenüber dem höchsten Band, bei JEDEM Vokal gleichermaßen
+// (siehe DEVLOG Nachtrag 51) - dadurch gehen die eigentlich
+// vorhandenen, vokalabhängigen RELATIVEN Verschiebungen zwischen den
+// Bändern im Summensignal akustisch unter. Werte grob am beobachteten
+// ~5x-Gefälle über 6 Bänder kalibriert - erster Schätzwert, kein
+// gemessenes Optimum.
+constexpr float kBandOutputGain[kNumBands] = {1.0f, 1.4f, 2.0f, 2.7f, 3.7f, 5.0f};
+q16 g_bandOutputGainQ16[kNumBands];
+
+// DIAGNOSE-SCHALTER: -1 = normaler Mix aller Bänder. 0..kNumBands-1 =
+// nur dieses eine Band hörbar, alle anderen stumm - testet, ob die
+// SYNTHESE-Seite selbst (Carrier gefiltert durch verschiedene Bänder)
+// überhaupt hörbar unterschiedlich klingt, unabhängig vom Mic-Signal/
+// Vokal. Siehe DEVLOG Nachtrag 53.
+constexpr int kSoloBand = -1;
 
 // Pulszug-Wavetable für den Carrier (siehe DEVLOG Nachtrag 13 für die
 // Begründung: gleichmäßigeres Obertonspektrum als ein Sägezahn). Hier
@@ -309,6 +337,18 @@ void audioTask(void *) {
     init_vocoder_bands_fixed(bands, kNumBands, kBandFreqLowHz, kBandFreqHighHz,
                               kBandQ, kAttackMsLow, kAttackMsHigh,
                               kReleaseMsLow, kReleaseMsHigh, (float)kSampleRateHz);
+    // Synthese-Filter separat mit breiterem Q neu konfigurieren, siehe
+    // Erklärung bei kSynthesisQ oben - dieselbe geometrische
+    // Frequenzverteilung wie init_vocoder_bands_fixed intern nutzt,
+    // nur mit anderem Q.
+    for (int b = 0; b < kNumBands; ++b) {
+        float t = (kNumBands == 1) ? 0.0f : (float)b / (float)(kNumBands - 1);
+        float freq = kBandFreqLowHz * powf(kBandFreqHighHz / kBandFreqLowHz, t);
+        bands[b].synthesisFilter.setBandpass(freq, kSynthesisQ, (float)kSampleRateHz);
+    }
+    for (int b = 0; b < kNumBands; ++b) {
+        g_bandOutputGainQ16[b] = float_to_q16(kBandOutputGain[b]);
+    }
     g_micDcUpdateRate = kQ16One - float_to_q16(expf(-1.0f / (0.001f * kMicDcTrackingMs * (float)kSampleRateHz)));
 
     g_compInputGainQ16 = float_to_q16(kCompInputGain);
@@ -393,7 +433,9 @@ void audioTask(void *) {
             q16 mixed = 0;
             for (int b = 0; b < kNumBands; ++b) {
                 bands[b].analyze(micQ16);
-                mixed += bands[b].synthesize(carrierQ16);
+                if (kSoloBand < 0 || kSoloBand == b) {
+                    mixed += q16_mul(bands[b].synthesize(carrierQ16), g_bandOutputGainQ16[b]);
+                }
             }
             for (int b = 0; b < kNumBands; ++b) {
                 if (bands[b].envelope > sBandMaxQ16[b]) sBandMaxQ16[b] = bands[b].envelope;
