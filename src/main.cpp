@@ -129,9 +129,27 @@ constexpr uint32_t kBufferSamples = 256;
 // 1-1.5kHz kaum noch etwas durch). Geometrisch gestaffelt: 150Hz /
 // ~424Hz / 1200Hz. Erster Schätzwert, kein gemessenes Optimum.
 constexpr int kNumBands = 6;
-constexpr float kBandFreqLowHz  = 150.0f;
-constexpr float kBandFreqHighHz = 2000.0f; // war 1200Hz - jetzt genutzt: bessere Mic-Bandbreite nach dem 12k/12k-Teiler-Umbau (siehe DEVLOG)
-constexpr float kBandQ          = 5.0f; // Analyse-Q - schmal für gute Formant-Trennung
+// Exakt nach der bestätigt funktionierenden Software-Referenz
+// (vocoderBands.ts, siehe DEVLOG Nachtrag 60): FREQ_MIN=90Hz,
+// FREQ_MAX=6000Hz, Q=5, logarithmisch/geometrisch verteilt - deutlich
+// verlässlicher als die zuvor übernommenen MFOS-Werte, weil das die
+// eigene, bereits bewiesen funktionierende Implementierung ist statt
+// eines fremden Projekts. Bandzahl bleibt bei 6 (nicht auf die vollen
+// 10 der Referenz erhöht - CPU-Budget, siehe Nachtrag 50).
+//
+// WICHTIGER, bewusster Unterschied zur Referenz: Deren Kommentar
+// verlangt explizit GLEICHES Q für Analyse UND Synthese - wir nutzen
+// hier weiterhin getrenntes Synthese-Q (siehe kSynthesisQ, Nachtrag
+// 54), weil unser einfacher Hardware-Pulston (anders als der
+// vermutlich vollere Software-Carrier) bei gleichem Q=5 auf der
+// Synthese-Seite ganze Bänder komplett stumm ließ (diskrete Obertöne
+// trafen das schmale Fenster nicht). Kein Widerspruch zur Referenz an
+// sich, sondern eine bewusste Anpassung an eine andere Carrier-
+// Charakteristik - im Hinterkopf behalten, falls die Formanten
+// dadurch "verschmiert" wirken (die Referenz warnt genau davor).
+constexpr float kBandFreqLowHz  = 90.0f; // wie Referenz - unterer Bereich funktioniert einwandfrei
+constexpr float kBandFreqHighHz = 1500.0f; // von 6000Hz zurückgesetzt (siehe DEVLOG Nachtrag 61) - Referenz-Wert ignoriert unsere analoge Mic-Bandbreitengrenze; Bänder 3-5 blieben bei 6000Hz-Obergrenze für JEDEN Vokal nahe 0 (totes Gewicht). 1500Hz ist der empirisch bestätigte, noch nutzbare Bereich nach dem 12k/12k-Teiler-Umbau.
+constexpr float kBandQ          = 5.0f; // Analyse-Q - schmal für gute Formant-Trennung, identisch zur Referenz
 // Synthese-Q bewusst SEPARAT und viel breiter als das Analyse-Q
 // (siehe DEVLOG Nachtrag 54): bei Q=5 trifft der Carrier (bzw. seine
 // diskreten Obertöne) das schmale Synthese-Fenster eines Bands nur
@@ -166,7 +184,7 @@ VocoderBandFixed bands[kNumBands];
 // zur SYNTHESE-Seite jetzt mit Rauschmix (recht gleichmäßige Energie
 // übers Spektrum) - erst den Rauschmix isoliert prüfen, dann ggf.
 // neu gewichten.
-constexpr float kBandOutputGain[kNumBands] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+constexpr float kBandOutputGain[kNumBands] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f}; // zurückgesetzt - die Gewichtung hat den einzigen bisher gehörten iii/uuu-Unterschied wieder verwischt, siehe DEVLOG Nachtrag 58
 q16 g_bandOutputGainQ16[kNumBands];
 
 // DIAGNOSE-SCHALTER: -1 = normaler Mix aller Bänder. 0..kNumBands-1 =
@@ -373,12 +391,21 @@ void controlTask(void *) {
 
 void audioTask(void *) {
     build_carrier_table();
-    init_vocoder_bands_fixed(bands, kNumBands, kBandFreqLowHz, kBandFreqHighHz,
-                              kBandQ, kAttackMsLow, kAttackMsHigh,
-                              kReleaseMsLow, kReleaseMsHigh, (float)kSampleRateHz);
+    // Geometrische Verteilung exakt wie in vocoderBands.ts
+    // (vocoderBandFrequencies()) - t=i/(N-1), freq = FREQ_MIN *
+    // (FREQ_MAX/FREQ_MIN)^t. Attack/Release-Staffelung (tief=träger,
+    // hoch=flinker) bleibt zusätzlich erhalten (in der Referenz nicht
+    // vorhanden, da Web Audio keine Fixed-Point-Zeitkonstanten-
+    // Vorberechnung braucht - für uns weiterhin sinnvoll).
+    for (int b = 0; b < kNumBands; ++b) {
+        float t = (kNumBands == 1) ? 0.0f : (float)b / (float)(kNumBands - 1);
+        float freq = kBandFreqLowHz * powf(kBandFreqHighHz / kBandFreqLowHz, t);
+        float attackMs = kAttackMsLow + t * (kAttackMsHigh - kAttackMsLow);
+        float releaseMs = kReleaseMsLow + t * (kReleaseMsHigh - kReleaseMsLow);
+        bands[b].init(freq, kBandQ, attackMs, releaseMs, (float)kSampleRateHz);
+    }
     // Synthese-Filter separat mit breiterem Q neu konfigurieren, siehe
-    // Erklärung bei kSynthesisQ oben - dieselbe geometrische
-    // Frequenzverteilung wie init_vocoder_bands_fixed intern nutzt,
+    // Erklärung bei kSynthesisQ oben - dieselben Frequenzen wie oben,
     // nur mit anderem Q.
     for (int b = 0; b < kNumBands; ++b) {
         float t = (kNumBands == 1) ? 0.0f : (float)b / (float)(kNumBands - 1);
