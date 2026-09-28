@@ -345,8 +345,8 @@ q16 g_compEnvelope = 0;
 // --- Noise-Gate mit Hysterese (siehe DEVLOG Nachtrag 19/20/23 für die
 // Herleitung, insbesondere warum Hysterese statt einer einzelnen
 // Schwelle nötig war). Werte ebenfalls neu zu kalibrieren. ---
-constexpr float kGateOpenThreshold  = 0.050f; // war 0.020 - Messung zeigte Ruhepegel bei 17-24/1000, direkt auf der alten Schwelle -> Geflacker, siehe DEVLOG
-constexpr float kGateCloseThreshold = 0.030f; // war 0.008 - mit Abstand über dem beobachteten Ruhepegel
+constexpr float kGateOpenThreshold  = 0.090f; // war 0.050 - Ruhepegel liegt jetzt bei 33-37/1000 (Rauschanteil im Carrier + 6 aktive Bänder), siehe DEVLOG Nachtrag 62
+constexpr float kGateCloseThreshold = 0.055f; // war 0.030 - lag UNTER dem Ruhepegel, dadurch schloss das Gate nach dem Öffnen nie wieder
 constexpr float kGateAttackMs   = 5.0f;
 constexpr float kGateReleaseMs  = 40.0f; // war 120ms - vermutlich Hauptursache für hörbares Nachschwingen nach dem Sprechen, siehe DEVLOG
 
