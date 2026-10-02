@@ -514,9 +514,24 @@ q16 g_compEnvelope = 0;
 
 // --- Noise-Gate mit Hysterese (siehe DEVLOG Nachtrag 19/20/23 für die
 // Herleitung, insbesondere warum Hysterese statt einer einzelnen
-// Schwelle nötig war). Werte ebenfalls neu zu kalibrieren. ---
-constexpr float kGateOpenThreshold  = 0.090f; // war 0.050 - Ruhepegel liegt jetzt bei 33-37/1000 (Rauschanteil im Carrier + 6 aktive Bänder), siehe DEVLOG Nachtrag 62
-constexpr float kGateCloseThreshold = 0.055f; // war 0.030 - lag UNTER dem Ruhepegel, dadurch schloss das Gate nach dem Öffnen nie wieder
+// Schwelle nötig war). ---
+//
+// UMBAU (siehe DEVLOG, Vokaltest nach INMP441-Umstieg): Der Gate-
+// Detektor ist jetzt die SUMME DER ANALYSE-HÜLLKURVEN (reines Mic-
+// Signal), nicht mehr die Kompressor-Hüllkurve des Ausgangs
+// (g_compEnvelope). Gründe:
+// - Die Ausgangshüllkurve hängt von Carrier-Tonhöhe, Rauschmix,
+//   Bandgewichtung und Kompressor ab - jede Änderung dort verschob den
+//   Ruhepegel und erzwang neue Schwellen (Nachtrag 62).
+// - Sie bildet eine Schleife über jede DAC->Mic-Rückkopplung (Ausgang
+//   hält das Gate offen, das den Ausgang durchlässt).
+// - Im Vokaltest lag sie beim Sprechen bei 66-244/1000, also direkt um
+//   die alten Schwellen herum -> Gate flatterte mitten im Vokal.
+// Analyse-Summe aus den Messungen (bandsAvg, 6 Bänder summiert):
+//   Stille ~0.002 (Spitzen grob bis 0.01), Rosa Rauschen ~0.06,
+//   Sprache (a/i/u) ~0.15-0.45 -> großer, klar trennbarer Abstand.
+constexpr float kGateOpenThreshold  = 0.050f; // ~15x Stille, ~5x unter leiser Sprache
+constexpr float kGateCloseThreshold = 0.025f; // halbe Öffnungsschwelle, über den Stille-Spitzen
 constexpr float kGateAttackMs   = 5.0f;
 constexpr float kGateReleaseMs  = 40.0f; // war 120ms - vermutlich Hauptursache für hörbares Nachschwingen nach dem Sprechen, siehe DEVLOG
 
@@ -645,6 +660,10 @@ void audioTask(void *) {
     // Vokalen. Das Maximum oben springt bei Rauschen zu stark, um daraus
     // einen Frequenzgang oder Grundpegel abzulesen.
     static int64_t sBandSum[kNumBands] = {};
+    // Gate-Detektor (Summe der Analyse-Hüllkurven): Mittel und Maximum
+    // pro Fenster - Grundlage für die Feinjustierung der Gate-Schwellen.
+    static int64_t sGateDetSum = 0;
+    static q16 sGateDetMaxQ16 = 0;
     static int sLastPotPermille = 0;
     static int sLastCarrierHzInt = 0;
     static int sLastGateEnvPermille = 0;
@@ -696,10 +715,15 @@ void audioTask(void *) {
                     mixed += q16_mul(bands[b].synthesize(synthCarrierQ16), g_bandOutputGainQ16[b]);
                 }
             }
+            // Gate-Detektor: Summe der Analyse-Hüllkurven (siehe oben).
+            q16 gateDetector = 0;
             for (int b = 0; b < kNumBands; ++b) {
                 if (bands[b].envelope > sBandMaxQ16[b]) sBandMaxQ16[b] = bands[b].envelope;
                 sBandSum[b] += bands[b].envelope;
+                gateDetector += bands[b].envelope;
             }
+            if (gateDetector > sGateDetMaxQ16) sGateDetMaxQ16 = gateDetector;
+            sGateDetSum += gateDetector;
 
             // Level -> Kompressor -> Makeup statt hartem Clipping.
             mixed = q16_mul(mixed, g_compInputGainQ16);
@@ -717,7 +741,7 @@ void audioTask(void *) {
 
             // Noise-Gate mit Hysterese (Schmitt-Trigger-Muster).
             q16 gateThreshold = g_gateIsOpen ? g_gateCloseThresholdQ16 : g_gateOpenThresholdQ16;
-            bool gateShouldBeOpen = (g_compEnvelope > gateThreshold);
+            bool gateShouldBeOpen = (gateDetector > gateThreshold);
             g_gateIsOpen = gateShouldBeOpen;
             q16 gateTarget = gateShouldBeOpen ? kQ16One : 0;
             q16 gateCoeff = (gateTarget > g_gateGain) ? g_gateAttackCoeff : g_gateReleaseCoeff;
@@ -755,7 +779,7 @@ void audioTask(void *) {
         sLastMicDcPermille = (int)(((int64_t)g_micDcState * 1000) / kQ16One);
         sLastMicFill = mic_available();
 
-        if (++sBufferCount >= 250) {
+        if (++sBufferCount >= 100) {
             int micMinPermille = (int)(((int64_t)sMicMinQ16 * 1000) / kQ16One);
             int micMaxPermille = (int)(((int64_t)sMicMaxQ16 * 1000) / kQ16One);
             printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 gateEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
@@ -780,6 +804,10 @@ void audioTask(void *) {
             // Mittelwerte in 1/10000 (feiner als die Promille-Skala von
             // bands[] - leise Bänder liegen sonst alle bei 0-5).
             const int64_t kSamplesInWindow = (int64_t)sBufferCount * kBufferSamples;
+            printf("  gateDet: avg=%d max=%d (x/10000, Schwellen open=%d close=%d)\n",
+                   (int)((sGateDetSum * 10000) / ((int64_t)kQ16One * kSamplesInWindow)),
+                   (int)(((int64_t)sGateDetMaxQ16 * 10000) / kQ16One),
+                   (int)(kGateOpenThreshold * 10000.0f), (int)(kGateCloseThreshold * 10000.0f));
             printf("  bandsAvg[0..%d] (x/10000)=", kNumBands - 1);
             for (int b = 0; b < kNumBands; ++b) {
                 int avgPerTenThousand = (int)((sBandSum[b] * 10000) / ((int64_t)kQ16One * kSamplesInWindow));
@@ -797,6 +825,8 @@ void audioTask(void *) {
                 sBandMaxQ16[b] = 0;
                 sBandSum[b] = 0;
             }
+            sGateDetSum = 0;
+            sGateDetMaxQ16 = 0;
         }
 
         // WICHTIG - PRIORITY-STARVATION-FIX (siehe DEVLOG Nachtrag 8):
