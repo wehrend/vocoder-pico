@@ -755,7 +755,7 @@ void audioTask(void *) {
         sLastMicDcPermille = (int)(((int64_t)g_micDcState * 1000) / kQ16One);
         sLastMicFill = mic_available();
 
-        if (++sBufferCount >= 100) {
+        if (++sBufferCount >= 250) {
             int micMinPermille = (int)(((int64_t)sMicMinQ16 * 1000) / kQ16One);
             int micMaxPermille = (int)(((int64_t)sMicMaxQ16 * 1000) / kQ16One);
             printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 gateEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
