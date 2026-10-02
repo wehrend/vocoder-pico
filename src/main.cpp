@@ -346,7 +346,7 @@ constexpr bool kInvertPot = false;
 // der Größenordnung, die der alte ADC-Pfad lieferte (Vollausschlag dort
 // ebenfalls 1.0). Über micMin/micMax in der Diagnose nachkalibrieren -
 // Ziel: normale Sprache mit Spitzen um ~200-500/1000. Max. 7.
-constexpr int kMicGainShift = 6;
+constexpr int kMicGainShift = 3; // war 6 - Spitzen lagen bei ±4000-5600/1000, siehe DEVLOG
 
 // Ringpuffer: 1024 Wörter = 4096 Bytes. Der DMA-Ring-Modus verlangt,
 // dass der Puffer auf seine eigene Größe ausgerichtet ist.
@@ -640,6 +640,11 @@ void audioTask(void *) {
     // kNumBands mit, kein Handeintrag mehr nötig beim nächsten
     // Hochskalieren (siehe DEVLOG).
     static q16 sBandMaxQ16[kNumBands] = {};
+    // Mittelwert der Band-Hüllkurven über das Diagnosefenster (Summe
+    // über alle Samples) - für Messungen mit Rosa Rauschen / Stille /
+    // Vokalen. Das Maximum oben springt bei Rauschen zu stark, um daraus
+    // einen Frequenzgang oder Grundpegel abzulesen.
+    static int64_t sBandSum[kNumBands] = {};
     static int sLastPotPermille = 0;
     static int sLastCarrierHzInt = 0;
     static int sLastGateEnvPermille = 0;
@@ -693,6 +698,7 @@ void audioTask(void *) {
             }
             for (int b = 0; b < kNumBands; ++b) {
                 if (bands[b].envelope > sBandMaxQ16[b]) sBandMaxQ16[b] = bands[b].envelope;
+                sBandSum[b] += bands[b].envelope;
             }
 
             // Level -> Kompressor -> Makeup statt hartem Clipping.
@@ -771,6 +777,15 @@ void audioTask(void *) {
                 printf("%d ", bandPermille);
             }
             printf("\n");
+            // Mittelwerte in 1/10000 (feiner als die Promille-Skala von
+            // bands[] - leise Bänder liegen sonst alle bei 0-5).
+            const int64_t kSamplesInWindow = (int64_t)sBufferCount * kBufferSamples;
+            printf("  bandsAvg[0..%d] (x/10000)=", kNumBands - 1);
+            for (int b = 0; b < kNumBands; ++b) {
+                int avgPerTenThousand = (int)((sBandSum[b] * 10000) / ((int64_t)kQ16One * kSamplesInWindow));
+                printf("%d ", avgPerTenThousand);
+            }
+            printf("\n");
             sBufferCount = 0;
             sSumUs = 0;
             sMaxUs = 0;
@@ -778,7 +793,10 @@ void audioTask(void *) {
             sWaitMaxUs = 0;
             sMicMinQ16 = kQ16One;
             sMicMaxQ16 = -kQ16One;
-            for (int b = 0; b < kNumBands; ++b) sBandMaxQ16[b] = 0;
+            for (int b = 0; b < kNumBands; ++b) {
+                sBandMaxQ16[b] = 0;
+                sBandSum[b] = 0;
+            }
         }
 
         // WICHTIG - PRIORITY-STARVATION-FIX (siehe DEVLOG Nachtrag 8):
