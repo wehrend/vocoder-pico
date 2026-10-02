@@ -40,6 +40,11 @@ add_executable(envelope_talkbox
     src/main.cpp
 )
 
+# INMP441-I2S-Mikrofon: PIO-Programm des I2S-Empfängers übersetzen.
+# Erzeugt i2s_mic.pio.h im Build-Verzeichnis (Include-Pfad setzt das
+# SDK automatisch), siehe DEVLOG (Umstieg MAX4466/ADC -> INMP441).
+pico_generate_pio_header(envelope_talkbox ${CMAKE_CURRENT_LIST_DIR}/src/i2s_mic.pio)
+
 # FreeRTOSConfig.h liegt im Projekt-Root (nicht unter src/) - Pfad hier
 # bekanntmachen, damit FreeRTOS.h ihn findet.
 target_include_directories(envelope_talkbox PRIVATE
@@ -58,7 +63,9 @@ target_compile_definitions(envelope_talkbox PRIVATE
 target_link_libraries(envelope_talkbox PRIVATE
     pico_stdlib
     pico_audio_i2s
-    hardware_adc
+    hardware_adc      # nur noch Pot
+    hardware_pio      # INMP441-Empfänger
+    hardware_dma      # INMP441 -> Ringpuffer
     FreeRTOS-Kernel
     FreeRTOS-Kernel-Heap4
 )

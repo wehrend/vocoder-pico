@@ -1,0 +1,42 @@
+; i2s_mic.pio - I2S-Empfänger (Master) für das INMP441, siehe DEVLOG.
+;
+; Der RP2040 ist hier der I2S-MASTER: wir erzeugen SCK (Bit-Takt) und WS
+; (Wortauswahl, links/rechts) selbst, das INMP441 liefert passend dazu
+; seine Daten auf SD.
+;
+; Timing: genau 128 PIO-Takte pro Frame (2 Takte pro SCK-Periode,
+; 32 SCK-Perioden je Kanal, 2 Kanäle). Jede Instruktion ist entweder
+; eine fallende (SCK=0) oder eine steigende (SCK=1) Flanke - die
+; "set x"-Instruktionen sind selbst die erste fallende Flanke ihres
+; Slots und kosten deshalb keinen Extra-Takt mehr (vorher 130 Takte).
+;
+; WS wechselt immer zusammen mit einer fallenden SCK-Flanke, wie I2S es
+; verlangt.
+;
+; I2S-Eigenheit: Das MSB erscheint erst EINEN Takt nach dem WS-Wechsel.
+; Das erste "in" eines Slots liest daher das Verzögerungsbit (beim
+; INMP441 hochohmig -> per Pulldown 0). Dieses Bit landet als oberstes
+; Bit im 32-Bit-Wort und wird in der Software mit "raw << 1"
+; herausgeschoben (siehe hello_mic.cpp).
+;
+; Wir lesen NUR den linken Kanal aus (dafür muss das INMP441 L/R-Pin auf
+; GND liegen) - der rechte Kanal wird getaktet, aber verworfen.
+
+.program i2s_mic_in
+.side_set 2
+
+; side-set Bitbelegung: Bit1 = WS, Bit0 = SCK (Basis-Pin = SCK, SCK+1 = WS)
+
+.wrap_target
+    set x, 30             side 0b00   ; fallend, WS=0: linker Slot beginnt
+left_loop:
+    in pins, 1            side 0b01   ; steigend: Bit einlesen
+    jmp x-- left_loop     side 0b00   ; fallend: Mic schiebt nächstes Bit nach
+    in pins, 1            side 0b01   ; steigend: 32. Bit des linken Slots
+    set x, 30             side 0b10   ; fallend, WS=1: rechter Slot beginnt
+right_loop:
+    nop                   side 0b11   ; steigend: rechter Slot nur getaktet
+    jmp x-- right_loop    side 0b10   ; fallend
+    nop                   side 0b11   ; steigend: 32. Flanke des rechten Slots
+.wrap
+; Takte: links 1 + 31*2 + 1 = 64, rechts 1 + 31*2 + 1 = 64 -> 128 je Frame
