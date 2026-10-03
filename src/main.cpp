@@ -138,8 +138,8 @@ constexpr uint kMicSdPin  = 12;
 // Die vorherige Eingrenzung auf 180-300Hz (Nachtrag 38/39) war nur ein
 // Software-seitiges Umgehen des Symptoms, keine Lösung - jetzt nicht
 // mehr nötig.
-constexpr float kMinCarrierHz = 80.0f;
-constexpr float kMaxCarrierHz = 400.0f;
+constexpr float kMinCarrierHz = 110.0f; // VORÜBERGEHEND fest für A/B-Tests (war 80)
+constexpr float kMaxCarrierHz = 110.0f; // VORÜBERGEHEND fest für A/B-Tests (war 400)
 
 // Rechenlast ist jetzt trivial (1 Bandpass statt 12) - volle 44.1kHz
 // sind wieder problemlos drin, kein Grund mehr für die 22.05kHz-
@@ -173,7 +173,10 @@ constexpr int kNumBands = 10;
 constexpr float kBandFreqLowHz  = 90.0f;
 constexpr float kBandFreqHighHz = 6000.0f;
 constexpr float kBandQ          = 5.0f;
-constexpr float kSynthesisQ     = 5.0f; // war 1.2 - Referenz verlangt gleiches Q
+constexpr float kSynthesisQ     = 2.0f; // TEST: Referenz 5.0 - bei Q=5 fällt pro Synthese-
+// band meist nur EIN Oberton des Carriers (Orgelklang, kaum Vokalfarbe).
+// Q~2 ist für 10 Bänder (~0.68 Oktaven Abstand) etwa lückenlos.
+// Messen über die Diagnosezeile outAvg (Vokaltest aaa/iii/uuu).
 
 // Hüllkurve: Referenz nutzt Tone.Follower(0.02) = Gleichrichter +
 // einpoliger Tiefpass mit Grenzfrequenz 1/0.02s = 50 Hz, also eine
@@ -200,7 +203,9 @@ VocoderBandFixed bands[kNumBands];
 // zur SYNTHESE-Seite jetzt mit Rauschmix (recht gleichmäßige Energie
 // übers Spektrum) - erst den Rauschmix isoliert prüfen, dann ggf.
 // neu gewichten.
-constexpr float kBandOutputGain[kNumBands] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f}; // zurückgesetzt - die Gewichtung hat den einzigen bisher gehörten iii/uuu-Unterschied wieder verwischt, siehe DEVLOG Nachtrag 58
+constexpr float kBandOutputGain[kNumBands] = {
+    0.45f, 0.5f, 0.7f, 1.0f, 1.5f, 2.2f, 3.4f, 5.0f, 7.5f, 14.0f
+}; // gleicht den gemessenen Frequenzgang des Sägezahn-Carriers aus (110 Hz, Synthese-Q 2), siehe DEVLOG
 q16 g_bandOutputGainQ16[kNumBands];
 
 // DIAGNOSE-SCHALTER: -1 = normaler Mix aller Bänder. 0..kNumBands-1 =
@@ -259,11 +264,13 @@ void build_carrier_table() {
     // Problem an der Quelle, statt nachträglich zu filtern (siehe
     // DEVLOG Nachtrag 36 - der Ausgangs-Tiefpass hatte einen
     // unerklärten Nebeneffekt auf die Gate-Rückkopplung).
-    constexpr float kDutyCycle = 0.5f;
+    // Sägezahn statt 50%-Rechteck (Referenz-Nachbau): alle Obertöne mit
+    // 1/n statt nur ungerade - beim Rechteck blieben bei Q=5 gerade die
+    // Formantbänder (580/930/1480 Hz) ohne Oberton, siehe DEVLOG.
     for (int i = 0; i < kCarrierTableSize; ++i) {
         float phase = (float)i / (float)kCarrierTableSize;
-        float pulse = (phase < kDutyCycle) ? 1.0f : -1.0f;
-        carrierTable[i] = float_to_q16(pulse);
+        float saw = 2.0f * phase - 1.0f;
+        carrierTable[i] = float_to_q16(saw);
     }
 }
 
@@ -494,7 +501,7 @@ QueueHandle_t g_carrierFreqQueue = nullptr;
 // Nicht nachgebaut: Soft-Knee und die automatische Makeup-Verstärkung
 // des Web-Audio-DynamicsCompressor - kCompMakeup ggf. nach Gehör.
 constexpr int   kAnalysisGainBoost = 100;   // ANALYSIS_GAIN_BOOST
-constexpr float kCompInputGain  = 10.0f;    // SYNTH_FIXED_LEVEL (war 2.0)
+constexpr float kCompInputGain  = 0.2f;     // Referenz: 10 - Hardware-Pegel liegt ~30 dB über dem Browser (Reduktion war -55 dB statt ~-20)
 constexpr float kCompThresholdDb = -35.0f;  // war 0.3 linear (~-10 dB)
 constexpr float kCompRatio      = 8.0f;
 constexpr float kCompAttackMs   = 5.0f;
@@ -663,6 +670,7 @@ void audioTask(void *) {
     // Vokalen. Das Maximum oben springt bei Rauschen zu stark, um daraus
     // einen Frequenzgang oder Grundpegel abzulesen.
     static int64_t sBandSum[kNumBands] = {};
+    static int64_t sOutSum[kNumBands] = {};
     static uint64_t sMicWaitSumUs = 0;
     static int64_t sGateDetSum = 0;
     static q16 sGateDetMaxQ16 = 0;
@@ -724,7 +732,12 @@ void audioTask(void *) {
                     // bleibt die volle Q24-Auflösung der Hüllkurve erhalten.
                     q16 vcaGain = (q16)(((int64_t)bands[b].envelopeQ24 * g_bandOutputGainQ16[b]) >> kQ24Frac);
                     q16 filteredCarrier = bands[b].synthesisFilter.process(synthCarrierQ16);
-                    mixed += q16_mul(filteredCarrier, vcaGain);
+                    q16 bandOut = q16_mul(filteredCarrier, vcaGain);
+                    mixed += bandOut;
+                    // Ausgabe-Diagnose: mittlerer Betrag pro Syntheseband -
+                    // zeigt, ob die Vokalunterschiede der Analyse auch im
+                    // Ausgang ankommen (vor Kompressor/Gate).
+                    sOutSum[b] += (bandOut < 0) ? -bandOut : bandOut;
                 }
             }
             q16 gateDetRaw = 0;
@@ -839,6 +852,11 @@ void audioTask(void *) {
             // Mittelwerte in 1/10000 (feiner als die Promille-Skala von
             // bands[] - leise Bänder liegen sonst alle bei 0-5).
             const int64_t kSamplesInWindow = (int64_t)sBufferCount * kBufferSamples;
+            printf("  outAvg[0..%d] (x/1000)=", kNumBands - 1);
+            for (int b = 0; b < kNumBands; ++b) {
+                printf("%d ", (int)((sOutSum[b] * 1000) / ((int64_t)kQ16One * kSamplesInWindow)));
+            }
+            printf("\n");
             printf("  bandsAvg[0..%d] (x/10000)=", kNumBands - 1);
             for (int b = 0; b < kNumBands; ++b) {
                 int avgPerTenThousand = (int)((sBandSum[b] * 10000) / ((int64_t)kQ16One * kSamplesInWindow));
@@ -855,6 +873,7 @@ void audioTask(void *) {
             for (int b = 0; b < kNumBands; ++b) {
                 sBandMaxQ16[b] = 0;
                 sBandSum[b] = 0;
+                sOutSum[b] = 0;
             }
             sMicWaitSumUs = 0;
             sGateDetSum = 0;
