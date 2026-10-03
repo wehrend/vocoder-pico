@@ -46,6 +46,8 @@ Schritt" unten).
   bei höheren Carrier-Frequenzen hörbar/unangenehm klingen - erst mal
   akzeptiert, siehe "Nächster Schritt".
 
+![Screenshot meiner App](./wiring-diagram.svg)
+
 ## Unterschiede zur PicoADK-Version
 
 - I2S-Pins sind frei wählbar (unten), da kein fest verdrahteter
