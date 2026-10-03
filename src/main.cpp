@@ -159,43 +159,28 @@ constexpr uint32_t kBufferSamples = 256;
 // (Gain-Bandbreite-Kompromiss am MAX4466 lässt oberhalb von grob
 // 1-1.5kHz kaum noch etwas durch). Geometrisch gestaffelt: 150Hz /
 // ~424Hz / 1200Hz. Erster Schätzwert, kein gemessenes Optimum.
-constexpr int kNumBands = 6;
-// Exakt nach der bestätigt funktionierenden Software-Referenz
-// (vocoderBands.ts, siehe DEVLOG Nachtrag 60): FREQ_MIN=90Hz,
-// FREQ_MAX=6000Hz, Q=5, logarithmisch/geometrisch verteilt - deutlich
-// verlässlicher als die zuvor übernommenen MFOS-Werte, weil das die
-// eigene, bereits bewiesen funktionierende Implementierung ist statt
-// eines fremden Projekts. Bandzahl bleibt bei 6 (nicht auf die vollen
-// 10 der Referenz erhöht - CPU-Budget, siehe Nachtrag 50).
+// === 10-BAND-NACHBAU DER SOFTWARE-REFERENZ (modular-synth) ===
+// Quellen: src/nodes/VocoderBands.ts, VocoderAnalysisNode.tsx,
+// VocoderSynthNode.tsx. Ziel ist ein TREUER Nachbau der bewiesen
+// funktionierenden Referenz statt weiterer eigener Theorien (siehe
+// DEVLOG: Baseline 1ccc1be, Tag baseline-gut). Einzige bewusste
+// Abweichungen: Carrier (unverändert aus der Baseline) und das Gate
+// (die Referenz hat keins, siehe unten).
 //
-// WICHTIGER, bewusster Unterschied zur Referenz: Deren Kommentar
-// verlangt explizit GLEICHES Q für Analyse UND Synthese - wir nutzen
-// hier weiterhin getrenntes Synthese-Q (siehe kSynthesisQ, Nachtrag
-// 54), weil unser einfacher Hardware-Pulston (anders als der
-// vermutlich vollere Software-Carrier) bei gleichem Q=5 auf der
-// Synthese-Seite ganze Bänder komplett stumm ließ (diskrete Obertöne
-// trafen das schmale Fenster nicht). Kein Widerspruch zur Referenz an
-// sich, sondern eine bewusste Anpassung an eine andere Carrier-
-// Charakteristik - im Hinterkopf behalten, falls die Formanten
-// dadurch "verschmiert" wirken (die Referenz warnt genau davor).
-constexpr float kBandFreqLowHz  = 90.0f; // wie Referenz - unterer Bereich funktioniert einwandfrei
-constexpr float kBandFreqHighHz = 6000.0f; // von 6000Hz zurückgesetzt (siehe DEVLOG Nachtrag 61) - Referenz-Wert ignoriert unsere analoge Mic-Bandbreitengrenze; Bänder 3-5 blieben bei 6000Hz-Obergrenze für JEDEN Vokal nahe 0 (totes Gewicht). 1500Hz ist der empirisch bestätigte, noch nutzbare Bereich nach dem 12k/12k-Teiler-Umbau.
-constexpr float kBandQ          = 5.0f; // Analyse-Q - schmal für gute Formant-Trennung, identisch zur Referenz
-// Synthese-Q bewusst SEPARAT und viel breiter als das Analyse-Q
-// (siehe DEVLOG Nachtrag 54): bei Q=5 trifft der Carrier (bzw. seine
-// diskreten Obertöne) das schmale Synthese-Fenster eines Bands nur
-// zufällig - je nach exakter Tonhöhe bekommt ein Band mal viel, mal
-// fast keine Carrier-Energie zum Formen, UNABHÄNGIG vom Sprachinhalt.
-// Ein breiteres Synthese-Fenster garantiert verlässlich Energie in
-// jedem Band, während die Analyse weiterhin scharf trennt.
-constexpr float kSynthesisQ     = 1.2f;
-// Tiefe Bänder etwas träger (Formanten bewegen sich langsamer), hohe
-// Bänder etwas flinker (Konsonanten/Transienten) - dieselbe Logik wie
-// im 12-Band-Projekt, siehe vocoder_band_fixed.h.
-constexpr float kAttackMsLow    = 8.0f;
-constexpr float kAttackMsHigh   = 3.0f;
-constexpr float kReleaseMsLow   = 120.0f;
-constexpr float kReleaseMsHigh  = 60.0f;
+// VocoderBands.ts: 10 Bänder, 90-6000 Hz geometrisch, Q=5 - und
+// ausdrücklich GLEICHES Q für Analyse und Synthese.
+constexpr int kNumBands = 10;
+constexpr float kBandFreqLowHz  = 90.0f;
+constexpr float kBandFreqHighHz = 6000.0f;
+constexpr float kBandQ          = 5.0f;
+constexpr float kSynthesisQ     = 5.0f; // war 1.2 - Referenz verlangt gleiches Q
+
+// Hüllkurve: Referenz nutzt Tone.Follower(0.02) = Gleichrichter +
+// einpoliger Tiefpass mit Grenzfrequenz 1/0.02s = 50 Hz, also eine
+// Zeitkonstante von 0.02/(2*pi) = 3.18 ms - SYMMETRISCH (gleich schnell
+// steigend wie fallend). Vorher: Attack 3-8 ms, Release 60-120 ms.
+constexpr float kFollowerSmoothingS = 0.02f;
+constexpr float kFollowerTauMs = 1000.0f * kFollowerSmoothingS / (2.0f * (float)M_PI);
 
 VocoderBandFixed bands[kNumBands];
 
@@ -215,7 +200,7 @@ VocoderBandFixed bands[kNumBands];
 // zur SYNTHESE-Seite jetzt mit Rauschmix (recht gleichmäßige Energie
 // übers Spektrum) - erst den Rauschmix isoliert prüfen, dann ggf.
 // neu gewichten.
-constexpr float kBandOutputGain[kNumBands] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f}; // zurückgesetzt - die Gewichtung hat den einzigen bisher gehörten iii/uuu-Unterschied wieder verwischt, siehe DEVLOG Nachtrag 58
+constexpr float kBandOutputGain[kNumBands] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f}; // zurückgesetzt - die Gewichtung hat den einzigen bisher gehörten iii/uuu-Unterschied wieder verwischt, siehe DEVLOG Nachtrag 58
 q16 g_bandOutputGainQ16[kNumBands];
 
 // DIAGNOSE-SCHALTER: -1 = normaler Mix aller Bänder. 0..kNumBands-1 =
@@ -497,29 +482,60 @@ QueueHandle_t g_carrierFreqQueue = nullptr;
 // 1-Band-Talkbox angepasst, jetzt durch die 3-Band-Summierung
 // (Nachtrag 44) wieder eine andere Signal-Skala als beim
 // 12-Band-Vocoder. Erster Schätzwert, kein gemessenes Optimum. ---
-constexpr float kCompInputGain  = 2.0f; // zurückgesetzt (0.8 war falsche Stellschraube - beeinflusst auch die Gate-Erkennung, siehe DEVLOG)
-constexpr float kCompThreshold  = 0.3f;
+// Gain-Struktur und Kompressor nach VocoderAnalysisNode.tsx /
+// VocoderSynthNode.tsx:
+//   Hüllkurve x100 (ANALYSIS_GAIN_BOOST) -> VCA pro Band -> Summe
+//   -> x10 (SYNTH_FIXED_LEVEL) -> Tone.Compressor(threshold -35 dB,
+//   ratio 8, attack 5 ms, release 150 ms) -> Makeup x6.
+// Der Kompressor rechnet jetzt wie Tone.js in dB (vorher linear:
+// "Schwelle + Überschuss/Ratio", das komprimiert große Pegel viel zu
+// schwach). Verstärkung wird alle kCompGainUpdateSamples Samples per
+// powf neu berechnet (ROM-Float des RP2040), dazwischen gehalten.
+// Nicht nachgebaut: Soft-Knee und die automatische Makeup-Verstärkung
+// des Web-Audio-DynamicsCompressor - kCompMakeup ggf. nach Gehör.
+constexpr int   kAnalysisGainBoost = 100;   // ANALYSIS_GAIN_BOOST
+constexpr float kCompInputGain  = 10.0f;    // SYNTH_FIXED_LEVEL (war 2.0)
+constexpr float kCompThresholdDb = -35.0f;  // war 0.3 linear (~-10 dB)
 constexpr float kCompRatio      = 8.0f;
 constexpr float kCompAttackMs   = 5.0f;
 constexpr float kCompReleaseMs  = 150.0f;
-constexpr float kCompMakeup     = 2.0f; // zurückgesetzt - 0.8 war nur zum Testen der (widerlegten) Lautstärke-Theorie, siehe DEVLOG Nachtrag 47
+constexpr float kCompMakeup     = 6.0f;     // war 2.0
+constexpr uint32_t kCompGainUpdateSamples = 16;
 
 q16 g_compInputGainQ16 = 0;
-q16 g_compThresholdQ16 = 0;
+float g_compThresholdLin = 0.0f;
+q16 g_compGainQ16 = 0;
 q16 g_compAttackCoeff = 0;
 q16 g_compReleaseCoeff = 0;
 q16 g_compMakeupQ16 = 0;
-q16 g_compRatioInvQ16 = 0;
 q16 g_compEnvelope = 0;
 
-// --- Noise-Gate mit Hysterese (siehe DEVLOG Nachtrag 19/20/23 für die
-// Herleitung, insbesondere warum Hysterese statt einer einzelnen
-// Schwelle nötig war). Werte ebenfalls neu zu kalibrieren. ---
-constexpr float kGateOpenThreshold  = 0.090f; // war 0.050 - Ruhepegel liegt jetzt bei 33-37/1000 (Rauschanteil im Carrier + 6 aktive Bänder), siehe DEVLOG Nachtrag 62
-constexpr float kGateCloseThreshold = 0.055f; // war 0.030 - lag UNTER dem Ruhepegel, dadurch schloss das Gate nach dem Öffnen nie wieder
+// --- Noise-Gate mit Hysterese (siehe DEVLOG Nachtrag 19/20/23). ---
+// Die Referenz hat KEIN Gate. Hier trotzdem nötig: Mit x100 / x10 und
+// -35 dB-Schwelle hebt der Kompressor in Sprechpausen auch den
+// Grundpegel der Bänder deutlich hörbar an (im Browser filtert
+// vermutlich die Rauschunterdrückung des Mic-Eingangs).
+// Detektor: Summe der Analyse-Hüllkurven (reines Mic-Signal,
+// unabhängig von Carrier/Gain/Kompressor - die alte Kopplung an die
+// Ausgangshüllkurve hätte durch die neue Gain-Struktur ohnehin nicht
+// mehr gepasst). Weil die Hüllkurven jetzt mit 3 ms sehr schnell sind
+// und stark rippeln, wird die Summe zusätzlich geglättet.
+// Schwellen: ERSTE SCHÄTZUNG, aus den 6-Band-Messungen hochgerechnet
+// (Stille-Spitzen ~0.03, Sprache im Mittel ~0.1-0.2) - über die
+// Diagnosezeile "gateDet" kalibrieren. Höhere Schwellen (Richtung
+// Sprach-Mittelwert) wirken wie ein Expander und schneiden leise
+// Anteile zwischen Silben weg - das war vermutlich ein Teil dessen,
+// was die Baseline "knackiger" klingen ließ.
+constexpr float kGateOpenThreshold  = 0.060f;
+constexpr float kGateCloseThreshold = 0.030f;
+constexpr float kGateDetAttackMs    = 5.0f;
+constexpr float kGateDetReleaseMs   = 50.0f;
 constexpr float kGateAttackMs   = 5.0f;
-constexpr float kGateReleaseMs  = 40.0f; // war 120ms - vermutlich Hauptursache für hörbares Nachschwingen nach dem Sprechen, siehe DEVLOG
+constexpr float kGateReleaseMs  = 40.0f;
 
+q16 g_gateDetAttackCoeff = 0;
+q16 g_gateDetReleaseCoeff = 0;
+q16 g_gateDetector = 0;
 q16 g_gateOpenThresholdQ16 = 0;
 q16 g_gateCloseThresholdQ16 = 0;
 q16 g_gateAttackCoeff = 0;
@@ -570,9 +586,8 @@ void audioTask(void *) {
     for (int b = 0; b < kNumBands; ++b) {
         float t = (kNumBands == 1) ? 0.0f : (float)b / (float)(kNumBands - 1);
         float freq = kBandFreqLowHz * powf(kBandFreqHighHz / kBandFreqLowHz, t);
-        float attackMs = kAttackMsLow + t * (kAttackMsHigh - kAttackMsLow);
-        float releaseMs = kReleaseMsLow + t * (kReleaseMsHigh - kReleaseMsLow);
-        bands[b].init(freq, kBandQ, attackMs, releaseMs, (float)kSampleRateHz);
+        // Symmetrische Hüllkurve wie Tone.Follower: Attack = Release.
+        bands[b].init(freq, kBandQ, kFollowerTauMs, kFollowerTauMs, (float)kSampleRateHz);
     }
     // Synthese-Filter separat mit breiterem Q neu konfigurieren, siehe
     // Erklärung bei kSynthesisQ oben - dieselben Frequenzen wie oben,
@@ -585,16 +600,19 @@ void audioTask(void *) {
     g_carrierNoiseMixQ16 = float_to_q16(kCarrierNoiseMix);
     g_noiseShapeCoeff = float_to_q16(1.0f - expf(-2.0f * (float)M_PI * kNoiseShapeFreqHz / (float)kSampleRateHz));
     for (int b = 0; b < kNumBands; ++b) {
-        g_bandOutputGainQ16[b] = float_to_q16(kBandOutputGain[b]);
+        // Referenz-Boost x100 hier mit eingerechnet (VCA-Verstärkung).
+        g_bandOutputGainQ16[b] = float_to_q16(kBandOutputGain[b] * (float)kAnalysisGainBoost);
     }
     g_micDcUpdateRate = kQ16One - float_to_q16(expf(-1.0f / (0.001f * kMicDcTrackingMs * (float)kSampleRateHz)));
 
     g_compInputGainQ16 = float_to_q16(kCompInputGain);
-    g_compThresholdQ16 = float_to_q16(kCompThreshold);
+    g_compThresholdLin = powf(10.0f, kCompThresholdDb / 20.0f);
+    g_compGainQ16 = kQ16One;
     g_compAttackCoeff = float_to_q16(expf(-1.0f / (0.001f * kCompAttackMs * (float)kSampleRateHz)));
     g_compReleaseCoeff = float_to_q16(expf(-1.0f / (0.001f * kCompReleaseMs * (float)kSampleRateHz)));
     g_compMakeupQ16 = float_to_q16(kCompMakeup);
-    g_compRatioInvQ16 = float_to_q16(1.0f / kCompRatio);
+    g_gateDetAttackCoeff = float_to_q16(expf(-1.0f / (0.001f * kGateDetAttackMs * (float)kSampleRateHz)));
+    g_gateDetReleaseCoeff = float_to_q16(expf(-1.0f / (0.001f * kGateDetReleaseMs * (float)kSampleRateHz)));
     g_gateOpenThresholdQ16 = float_to_q16(kGateOpenThreshold);
     g_gateCloseThresholdQ16 = float_to_q16(kGateCloseThreshold);
     g_gateAttackCoeff = float_to_q16(expf(-1.0f / (0.001f * kGateAttackMs * (float)kSampleRateHz)));
@@ -645,6 +663,10 @@ void audioTask(void *) {
     // Vokalen. Das Maximum oben springt bei Rauschen zu stark, um daraus
     // einen Frequenzgang oder Grundpegel abzulesen.
     static int64_t sBandSum[kNumBands] = {};
+    static uint64_t sMicWaitSumUs = 0;
+    static int64_t sGateDetSum = 0;
+    static q16 sGateDetMaxQ16 = 0;
+    static q16 sCompGainMinQ16 = kQ16One; // stärkste Kompression im Fenster
     static int sLastPotPermille = 0;
     static int sLastCarrierHzInt = 0;
     static int sLastGateEnvPermille = 0;
@@ -676,9 +698,13 @@ void audioTask(void *) {
 
         sLastPotPermille = (int)(potNorm * 1000.0f);
         sLastCarrierHzInt = (int)carrierHz;
-        uint64_t loopStartUs = time_us_64();
-
+        // Mic-Wartezeit getrennt messen, damit avg wieder die echte
+        // Rechenlast zeigt (vorher steckte das Warten aufs Mic mit drin).
+        uint64_t micStartUs = time_us_64();
         mic_read_block(sMicBlock, kBufferSamples);
+        uint64_t loopStartUs = time_us_64();
+        uint32_t micWaitUs = (uint32_t)(loopStartUs - micStartUs);
+        sMicWaitSumUs += micWaitUs;
 
         for (uint32_t i = 0; i < kBufferSamples; ++i) {
             q16 micQ16 = sMicBlock[i];
@@ -693,31 +719,53 @@ void audioTask(void *) {
             for (int b = 0; b < kNumBands; ++b) {
                 bands[b].analyze(micQ16);
                 if (kSoloBand < 0 || kSoloBand == b) {
-                    mixed += q16_mul(bands[b].synthesize(synthCarrierQ16), g_bandOutputGainQ16[b]);
+                    // VCA: Hüllkurve x (Gewichtung x Referenz-Boost) zuerst,
+                    // dann mit dem gefilterten Carrier multiplizieren - so
+                    // bleibt die volle Q24-Auflösung der Hüllkurve erhalten.
+                    q16 vcaGain = (q16)(((int64_t)bands[b].envelopeQ24 * g_bandOutputGainQ16[b]) >> kQ24Frac);
+                    q16 filteredCarrier = bands[b].synthesisFilter.process(synthCarrierQ16);
+                    mixed += q16_mul(filteredCarrier, vcaGain);
                 }
             }
+            q16 gateDetRaw = 0;
             for (int b = 0; b < kNumBands; ++b) {
                 if (bands[b].envelope > sBandMaxQ16[b]) sBandMaxQ16[b] = bands[b].envelope;
                 sBandSum[b] += bands[b].envelope;
+                gateDetRaw += bands[b].envelope;
             }
+            q16 gateDetCoeff = (gateDetRaw > g_gateDetector) ? g_gateDetAttackCoeff : g_gateDetReleaseCoeff;
+            g_gateDetector = g_gateDetector + q16_mul(kQ16One - gateDetCoeff, gateDetRaw - g_gateDetector);
+            if (g_gateDetector > sGateDetMaxQ16) sGateDetMaxQ16 = g_gateDetector;
+            sGateDetSum += g_gateDetector;
 
             // Level -> Kompressor -> Makeup statt hartem Clipping.
             mixed = q16_mul(mixed, g_compInputGainQ16);
+            // Schutz gegen int32-Überlauf bei extremen Pegeln (Plosiv
+            // direkt ins Mic) - weit über allem, was Sprache erreicht.
+            constexpr q16 kMixedLimit = 16384 * kQ16One;
+            if (mixed > kMixedLimit) mixed = kMixedLimit;
+            if (mixed < -kMixedLimit) mixed = -kMixedLimit;
             q16 absMixed = (mixed < 0) ? -mixed : mixed;
             q16 compCoeff = (absMixed > g_compEnvelope) ? g_compAttackCoeff : g_compReleaseCoeff;
             g_compEnvelope = g_compEnvelope + q16_mul(kQ16One - compCoeff, absMixed - g_compEnvelope);
-            q16 compGain = kQ16One;
-            if (g_compEnvelope > g_compThresholdQ16) {
-                q16 excess = g_compEnvelope - g_compThresholdQ16;
-                q16 compressedLevel = g_compThresholdQ16 + q16_mul(excess, g_compRatioInvQ16);
-                compGain = (q16)(((int64_t)compressedLevel << kQ16Frac) / g_compEnvelope);
+            // dB-Kompressor (wie Tone.js): über der Schwelle wird der
+            // Pegelüberschuss in dB durch die Ratio geteilt:
+            //   gain = (env / thr)^(1/ratio - 1)
+            if ((i % kCompGainUpdateSamples) == 0) {
+                float envLin = (float)g_compEnvelope / (float)kQ16One;
+                float gain = 1.0f;
+                if (envLin > g_compThresholdLin) {
+                    gain = powf(envLin / g_compThresholdLin, 1.0f / kCompRatio - 1.0f);
+                }
+                g_compGainQ16 = float_to_q16(gain);
+                if (g_compGainQ16 < sCompGainMinQ16) sCompGainMinQ16 = g_compGainQ16;
             }
-            mixed = q16_mul(mixed, compGain);
+            mixed = q16_mul(mixed, g_compGainQ16);
             mixed = q16_mul(mixed, g_compMakeupQ16);
 
             // Noise-Gate mit Hysterese (Schmitt-Trigger-Muster).
             q16 gateThreshold = g_gateIsOpen ? g_gateCloseThresholdQ16 : g_gateOpenThresholdQ16;
-            bool gateShouldBeOpen = (g_compEnvelope > gateThreshold);
+            bool gateShouldBeOpen = (g_gateDetector > gateThreshold);
             g_gateIsOpen = gateShouldBeOpen;
             q16 gateTarget = gateShouldBeOpen ? kQ16One : 0;
             q16 gateCoeff = (gateTarget > g_gateGain) ? g_gateAttackCoeff : g_gateReleaseCoeff;
@@ -758,7 +806,7 @@ void audioTask(void *) {
         if (++sBufferCount >= 100) {
             int micMinPermille = (int)(((int64_t)sMicMinQ16 * 1000) / kQ16One);
             int micMaxPermille = (int)(((int64_t)sMicMaxQ16 * 1000) / kQ16One);
-            printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 gateEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
+            printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 compEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
                    __DATE__, __TIME__,
                    (unsigned long)(sSumUs / sBufferCount), (unsigned long)sMaxUs,
                    (unsigned long)(sWaitSumUs / sBufferCount), (unsigned long)sWaitMaxUs,
@@ -768,9 +816,20 @@ void audioTask(void *) {
             // Separate Zeile für die Band-Hüllkurven - Anzahl folgt
             // automatisch kNumBands, kein Umschreiben mehr nötig beim
             // nächsten Hochskalieren.
-            printf("  mic: fill=%lu/%lu under=%lu over=%lu\n",
+            printf("  mic: fill=%lu/%lu under=%lu over=%lu micWait=%luus\n",
                    (unsigned long)sLastMicFill, (unsigned long)kMicTargetFill,
-                   (unsigned long)g_micUnderruns, (unsigned long)g_micOverruns);
+                   (unsigned long)g_micUnderruns, (unsigned long)g_micOverruns,
+                   (unsigned long)(sMicWaitSumUs / sBufferCount));
+            {
+                const int64_t kSamplesInWin = (int64_t)sBufferCount * kBufferSamples;
+                float compMinGain = (float)sCompGainMinQ16 / (float)kQ16One;
+                int compMinDb = (compMinGain > 0.0f) ? (int)(20.0f * log10f(compMinGain)) : -999;
+                printf("  gateDet: avg=%d max=%d (x/10000, open=%d close=%d)  comp: maxReduktion=%ddB\n",
+                       (int)((sGateDetSum * 10000) / ((int64_t)kQ16One * kSamplesInWin)),
+                       (int)(((int64_t)sGateDetMaxQ16 * 10000) / kQ16One),
+                       (int)(kGateOpenThreshold * 10000.0f), (int)(kGateCloseThreshold * 10000.0f),
+                       compMinDb);
+            }
             printf("  bands[0..%d]=", kNumBands - 1);
             for (int b = 0; b < kNumBands; ++b) {
                 int bandPermille = (int)(((int64_t)sBandMaxQ16[b] * 1000) / kQ16One);
@@ -797,6 +856,10 @@ void audioTask(void *) {
                 sBandMaxQ16[b] = 0;
                 sBandSum[b] = 0;
             }
+            sMicWaitSumUs = 0;
+            sGateDetSum = 0;
+            sGateDetMaxQ16 = 0;
+            sCompGainMinQ16 = kQ16One;
         }
 
         // WICHTIG - PRIORITY-STARVATION-FIX (siehe DEVLOG Nachtrag 8):
