@@ -94,6 +94,8 @@
 #include "hardware/clocks.h"
 #include "hardware/dma.h"
 #include "hardware/pio.h"
+#include "hardware/sync.h"
+#include "pico/multicore.h"
 #include "i2s_mic.pio.h"
 #include "fixed_point.h"
 #include "biquad_fixed.h"
@@ -205,7 +207,9 @@ VocoderBandFixed bands[kNumBands];
 // neu gewichten.
 constexpr float kBandOutputGain[kNumBands] = {
     0.45f, 0.5f, 0.7f, 1.0f, 1.5f, 2.2f, 3.4f, 5.0f, 7.5f, 14.0f
-}; // gleicht den gemessenen Frequenzgang des Sägezahn-Carriers aus (110 Hz, Synthese-Q 2), siehe DEVLOG
+}; // gleicht den GEMESSENEN Frequenzgang des Sägezahn-Carriers aus (110 Hz,
+   // Synthese-Q 2: outAvg/bandsAvg pro Band, ~-5 dB/Oktave) - siehe DEVLOG,
+   // Tag vokale-hoerbar. Bei anderem Carrier/Tonhöhenbereich neu messen. // zurückgesetzt - die Gewichtung hat den einzigen bisher gehörten iii/uuu-Unterschied wieder verwischt, siehe DEVLOG Nachtrag 58
 q16 g_bandOutputGainQ16[kNumBands];
 
 // DIAGNOSE-SCHALTER: -1 = normaler Mix aller Bänder. 0..kNumBands-1 =
@@ -569,6 +573,79 @@ constexpr bool kOutputLowpassEnabled = false;
 q16 g_outputLowpassCoeff = 0;
 q16 g_outputLowpassState = 0;
 
+
+// =====================================================================
+// ZWEITER KERN (siehe DEVLOG, Kapitel 5 im Artikel: gleiches Muster wie
+// damals). Core1 läuft als eigene Endlosschleife AUSSERHALB von
+// FreeRTOS und rechnet die obere Hälfte der Bänder. Zwei Handshakes pro
+// PUFFER (nicht pro Sample) über die SIO-FIFO:
+//   Core0: Mic-Block + Carrier-Block vorbereiten -> push -> eigene
+//          Bänder rechnen -> pop (warten) -> Teilsummen zusammenführen,
+//          Kompressor, Gate, Ausgabe.
+//   Core1: pop (warten) -> seine Bänder rechnen -> push.
+// Jeder Kern rechnet NUR seine eigenen Bänder (eigene Filterzustände,
+// eigene Diagnose-Einträge) - es gibt keine gemeinsam beschriebenen
+// Variablen außer den getrennten Teilsummen-Arrays.
+//
+// VORAUSSETZUNG: configSUPPORT_PICO_SYNC_INTEROP = 0 in FreeRTOSConfig.h
+// (ist gesetzt). Bei 1 installiert der FreeRTOS-Port einen eigenen
+// FIFO-Interrupt auf Core0, der unsere Handshake-Nachrichten wegräumen
+// würde.
+// =====================================================================
+constexpr int kCore1FirstBand = kNumBands / 2; // Core0: 0..4, Core1: 5..9
+
+// Gemeinsame Eingangsdaten pro Puffer (von Core0 vor dem Start befüllt).
+q16 sMicBlock[kBufferSamples];
+q16 g_carrierBlock[kBufferSamples];
+// Getrennte Teilergebnisse pro Kern: [Kern][Sample].
+q16 g_mixPart[2][kBufferSamples];
+q16 g_gateDetPart[2][kBufferSamples];
+
+// Diagnose pro Band - jedes Band wird nur von "seinem" Kern beschrieben,
+// Core0 liest/setzt zurück, während Core1 gerade NICHT rechnet.
+q16 sBandMaxQ16[kNumBands] = {};
+int64_t sBandSum[kNumBands] = {};
+int64_t sOutSum[kNumBands] = {};
+
+// Rechnet die Bänder [firstBand, endBand) für den ganzen Puffer.
+void process_band_range(int firstBand, int endBand, int core) {
+    for (uint32_t i = 0; i < kBufferSamples; ++i) {
+        q16 micQ16 = sMicBlock[i];
+        q16 synthCarrierQ16 = g_carrierBlock[i];
+        q16 mix = 0;
+        q16 gateDet = 0;
+        for (int b = firstBand; b < endBand; ++b) {
+            bands[b].analyze(micQ16);
+            if (kSoloBand < 0 || kSoloBand == b) {
+                // VCA: Hüllkurve x (Gewichtung x Referenz-Boost) zuerst,
+                // dann mit dem gefilterten Carrier multiplizieren - so
+                // bleibt die volle Q24-Auflösung der Hüllkurve erhalten.
+                q16 vcaGain = (q16)(((int64_t)bands[b].envelopeQ24 * g_bandOutputGainQ16[b]) >> kQ24Frac);
+                q16 filteredCarrier = bands[b].synthesisFilter.process(synthCarrierQ16);
+                q16 bandOut = q16_mul(filteredCarrier, vcaGain);
+                mix += bandOut;
+                sOutSum[b] += (bandOut < 0) ? -bandOut : bandOut;
+            }
+            q16 env = bands[b].envelope;
+            if (env > sBandMaxQ16[b]) sBandMaxQ16[b] = env;
+            sBandSum[b] += env;
+            gateDet += env;
+        }
+        g_mixPart[core][i] = mix;
+        g_gateDetPart[core][i] = gateDet;
+    }
+}
+
+void core1_entry() {
+    for (;;) {
+        multicore_fifo_pop_blocking();  // Start-Signal von Core0
+        __dmb();                        // Eingangsdaten von Core0 sichtbar machen
+        process_band_range(kCore1FirstBand, kNumBands, 1);
+        __dmb();                        // Ergebnisse vor dem Fertig-Signal sichtbar machen
+        multicore_fifo_push_blocking(1);
+    }
+}
+
 void controlTask(void *) {
     float smoothedHz = 220.0f;
     for (;;) {
@@ -632,11 +709,13 @@ void audioTask(void *) {
     audio_buffer_pool_t *pool = setup_audio();
     setup_adc();
     setup_mic();
+    // Core1 starten, bevor das Mic vorgefüllt wird (Filter sind schon
+    // initialisiert). Läuft ab hier in core1_entry() und wartet.
+    multicore_launch_core1(core1_entry);
     mic_prefill();
 
     // Ein Puffer Mic-Samples pro Ausgabepuffer, vor der Sample-Schleife
     // komplett aus dem Ring geholt.
-    static q16 sMicBlock[kBufferSamples];
 
     uint32_t phase = 0;
     float carrierHz = 220.0f;
@@ -664,14 +743,15 @@ void audioTask(void *) {
     // Array statt fester Einzelvariablen - wächst automatisch mit
     // kNumBands mit, kein Handeintrag mehr nötig beim nächsten
     // Hochskalieren (siehe DEVLOG).
-    static q16 sBandMaxQ16[kNumBands] = {};
     // Mittelwert der Band-Hüllkurven über das Diagnosefenster (Summe
     // über alle Samples) - für Messungen mit Rosa Rauschen / Stille /
     // Vokalen. Das Maximum oben springt bei Rauschen zu stark, um daraus
     // einen Frequenzgang oder Grundpegel abzulesen.
-    static int64_t sBandSum[kNumBands] = {};
-    static int64_t sOutSum[kNumBands] = {};
     static uint64_t sMicWaitSumUs = 0;
+    // Zweikern-Diagnose: Rechenzeit der Core0-Bänder und wie lange Core0
+    // danach noch auf Core1 warten musste (beides gemittelt pro Puffer).
+    static uint64_t sCore0BandsSumUs = 0;
+    static uint64_t sCore1ExtraWaitSumUs = 0;
     static int64_t sGateDetSum = 0;
     static q16 sGateDetMaxQ16 = 0;
     static q16 sCompGainMinQ16 = kQ16One; // stärkste Kompression im Fenster
@@ -714,38 +794,35 @@ void audioTask(void *) {
         uint32_t micWaitUs = (uint32_t)(loopStartUs - micStartUs);
         sMicWaitSumUs += micWaitUs;
 
+        // 1) Carrier-Block für den ganzen Puffer vorbereiten (Phase,
+        //    Rausch-Formung - zustandsbehaftet, darum nur auf Core0).
         for (uint32_t i = 0; i < kBufferSamples; ++i) {
             q16 micQ16 = sMicBlock[i];
             if (micQ16 < sMicMinQ16) sMicMinQ16 = micQ16;
             if (micQ16 > sMicMaxQ16) sMicMaxQ16 = micQ16;
-
             q16 carrierQ16 = carrierTable[(phase >> 16) & (kCarrierTableSize - 1)];
             q16 noiseQ16 = next_noise_q16();
             g_noiseShapeState = g_noiseShapeState + q16_mul(g_noiseShapeCoeff, noiseQ16 - g_noiseShapeState);
-            q16 synthCarrierQ16 = carrierQ16 + q16_mul(g_carrierNoiseMixQ16, g_noiseShapeState - carrierQ16);
-            q16 mixed = 0;
-            for (int b = 0; b < kNumBands; ++b) {
-                bands[b].analyze(micQ16);
-                if (kSoloBand < 0 || kSoloBand == b) {
-                    // VCA: Hüllkurve x (Gewichtung x Referenz-Boost) zuerst,
-                    // dann mit dem gefilterten Carrier multiplizieren - so
-                    // bleibt die volle Q24-Auflösung der Hüllkurve erhalten.
-                    q16 vcaGain = (q16)(((int64_t)bands[b].envelopeQ24 * g_bandOutputGainQ16[b]) >> kQ24Frac);
-                    q16 filteredCarrier = bands[b].synthesisFilter.process(synthCarrierQ16);
-                    q16 bandOut = q16_mul(filteredCarrier, vcaGain);
-                    mixed += bandOut;
-                    // Ausgabe-Diagnose: mittlerer Betrag pro Syntheseband -
-                    // zeigt, ob die Vokalunterschiede der Analyse auch im
-                    // Ausgang ankommen (vor Kompressor/Gate).
-                    sOutSum[b] += (bandOut < 0) ? -bandOut : bandOut;
-                }
-            }
-            q16 gateDetRaw = 0;
-            for (int b = 0; b < kNumBands; ++b) {
-                if (bands[b].envelope > sBandMaxQ16[b]) sBandMaxQ16[b] = bands[b].envelope;
-                sBandSum[b] += bands[b].envelope;
-                gateDetRaw += bands[b].envelope;
-            }
+            g_carrierBlock[i] = carrierQ16 + q16_mul(g_carrierNoiseMixQ16, g_noiseShapeState - carrierQ16);
+            phase += phaseInc;
+        }
+
+        // 2) Core1 starten (obere Bänder), Core0 rechnet parallel die unteren.
+        __dmb();
+        multicore_fifo_push_blocking(1);
+        uint64_t core0StartUs = time_us_64();
+        process_band_range(0, kCore1FirstBand, 0);
+        uint64_t core0EndUs = time_us_64();
+        multicore_fifo_pop_blocking();  // warten, bis Core1 fertig ist
+        __dmb();
+        uint64_t core1DoneUs = time_us_64();
+        sCore0BandsSumUs += (uint32_t)(core0EndUs - core0StartUs);
+        sCore1ExtraWaitSumUs += (uint32_t)(core1DoneUs - core0EndUs);
+
+        // 3) Teilsummen zusammenführen, Kompressor, Gate, Ausgabe.
+        for (uint32_t i = 0; i < kBufferSamples; ++i) {
+            q16 mixed = g_mixPart[0][i] + g_mixPart[1][i];
+            q16 gateDetRaw = g_gateDetPart[0][i] + g_gateDetPart[1][i];
             q16 gateDetCoeff = (gateDetRaw > g_gateDetector) ? g_gateDetAttackCoeff : g_gateDetReleaseCoeff;
             g_gateDetector = g_gateDetector + q16_mul(kQ16One - gateDetCoeff, gateDetRaw - g_gateDetector);
             if (g_gateDetector > sGateDetMaxQ16) sGateDetMaxQ16 = g_gateDetector;
@@ -802,7 +879,6 @@ void audioTask(void *) {
             int16_t s = (int16_t)s32;
             samples[2 * i]     = s;
             samples[2 * i + 1] = s;
-            phase += phaseInc;
         }
 
         buf->sample_count = buf->max_sample_count;
@@ -833,6 +909,10 @@ void audioTask(void *) {
                    (unsigned long)sLastMicFill, (unsigned long)kMicTargetFill,
                    (unsigned long)g_micUnderruns, (unsigned long)g_micOverruns,
                    (unsigned long)(sMicWaitSumUs / sBufferCount));
+            printf("  cores: core0Bands=%luus core1Warten=%luus (Core1 rechnet Bänder %d..%d)\n",
+                   (unsigned long)(sCore0BandsSumUs / sBufferCount),
+                   (unsigned long)(sCore1ExtraWaitSumUs / sBufferCount),
+                   kCore1FirstBand, kNumBands - 1);
             {
                 const int64_t kSamplesInWin = (int64_t)sBufferCount * kBufferSamples;
                 float compMinGain = (float)sCompGainMinQ16 / (float)kQ16One;
@@ -876,6 +956,8 @@ void audioTask(void *) {
                 sOutSum[b] = 0;
             }
             sMicWaitSumUs = 0;
+            sCore0BandsSumUs = 0;
+            sCore1ExtraWaitSumUs = 0;
             sGateDetSum = 0;
             sGateDetMaxQ16 = 0;
             sCompGainMinQ16 = kQ16One;

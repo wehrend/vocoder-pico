@@ -58,11 +58,12 @@ target_compile_definitions(envelope_talkbox PRIVATE
     PICO_AUDIO_I2S_CLOCK_PIN_BASE=16
 )
 
-# pico_multicore nicht mehr nötig - Rechenlast ist mit nur einem
-# Envelope-Follower trivial, ein Kern reicht bequem (siehe DEVLOG).
+# pico_multicore wieder nötig: der 10-Band-Vocoder rechnet die obere
+# Hälfte der Bänder auf Core1 (siehe DEVLOG / main.cpp, core1_entry).
 target_link_libraries(envelope_talkbox PRIVATE
     pico_stdlib
     pico_audio_i2s
+    pico_multicore    # Core1 rechnet Bänder 5..9
     hardware_adc      # nur noch Pot
     hardware_pio      # INMP441-Empfänger
     hardware_dma      # INMP441 -> Ringpuffer
