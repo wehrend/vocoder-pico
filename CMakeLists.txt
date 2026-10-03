@@ -40,6 +40,11 @@ add_executable(envelope_talkbox
     src/main.cpp
 )
 
+# INMP441-I2S-Mikrofon: PIO-Programm des I2S-Empfängers übersetzen.
+# Erzeugt i2s_mic.pio.h im Build-Verzeichnis (Include-Pfad setzt das
+# SDK automatisch), siehe DEVLOG (Umstieg MAX4466/ADC -> INMP441).
+pico_generate_pio_header(envelope_talkbox ${CMAKE_CURRENT_LIST_DIR}/src/i2s_mic.pio)
+
 # FreeRTOSConfig.h liegt im Projekt-Root (nicht unter src/) - Pfad hier
 # bekanntmachen, damit FreeRTOS.h ihn findet.
 target_include_directories(envelope_talkbox PRIVATE
@@ -53,12 +58,15 @@ target_compile_definitions(envelope_talkbox PRIVATE
     PICO_AUDIO_I2S_CLOCK_PIN_BASE=16
 )
 
-# pico_multicore nicht mehr nötig - Rechenlast ist mit nur einem
-# Envelope-Follower trivial, ein Kern reicht bequem (siehe DEVLOG).
+# pico_multicore wieder nötig: der 10-Band-Vocoder rechnet die obere
+# Hälfte der Bänder auf Core1 (siehe DEVLOG / main.cpp, core1_entry).
 target_link_libraries(envelope_talkbox PRIVATE
     pico_stdlib
     pico_audio_i2s
-    hardware_adc
+    pico_multicore    # Core1 rechnet Bänder 5..9
+    hardware_adc      # nur noch Pot
+    hardware_pio      # INMP441-Empfänger
+    hardware_dma      # INMP441 -> Ringpuffer
     FreeRTOS-Kernel
     FreeRTOS-Kernel-Heap4
 )

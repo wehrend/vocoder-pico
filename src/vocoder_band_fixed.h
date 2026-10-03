@@ -10,7 +10,14 @@
 struct VocoderBandFixed {
     BiquadFixed analysisFilter;
     BiquadFixed synthesisFilter;
+    // Nach außen weiterhin Q16 (Synthese, Diagnose in main.cpp). Intern
+    // läuft die Hüllkurve in Q8.24 (envelopeQ24): In Q16 blieb sie bei
+    // leisen Signalen stecken - ein Anstieg brauchte (rectified-envelope)
+    // * (1-coeff) >= 1 Q16-Schritt, im 90-Hz-Band also eine Differenz
+    // von ~0.04. Darunter las das Band schlicht 0. Siehe DEVLOG
+    // (Messung mit Rosa Rauschen) und den Kommentar in biquad_fixed.h.
     q16 envelope = 0;
+    q24 envelopeQ24 = 0;
     q16 attackCoeff = 0;
     q16 releaseCoeff = 0;
 
@@ -22,14 +29,14 @@ struct VocoderBandFixed {
     }
 
     inline void analyze(q16 modulatorSample) {
-        q16 filtered = analysisFilter.process(modulatorSample);
-        q16 rectified = (filtered < 0) ? -filtered : filtered;
-        q16 coeff = (rectified > envelope) ? attackCoeff : releaseCoeff;
-        // Algebraisch identisch zu "coeff*envelope + (1-coeff)*rectified",
-        // aber nur 1 statt 2 Multiplikationen: envelope + (1-coeff)*(rectified-envelope)
+        q24 filtered = analysisFilter.processQ24(modulatorSample << (kQ24Frac - kQ16Frac));
+        q24 rectified = (filtered < 0) ? -filtered : filtered;
+        q16 coeff = (rectified > envelopeQ24) ? attackCoeff : releaseCoeff;
         q16 oneMinusCoeff = kQ16One - coeff;
-        q16 diff = rectified - envelope;
-        envelope = envelope + q16_mul(oneMinusCoeff, diff);
+        q24 diff = rectified - envelopeQ24;
+        // (1-coeff) in Q16 * diff in Q24 >> 16 -> Q24
+        envelopeQ24 = envelopeQ24 + (q24)(((int64_t)oneMinusCoeff * (int64_t)diff) >> kQ16Frac);
+        envelope = envelopeQ24 >> (kQ24Frac - kQ16Frac);
     }
 
     inline q16 synthesize(q16 carrierSample) {
