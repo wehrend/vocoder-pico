@@ -1,4 +1,4 @@
-# 12-Band-Vocoder mit FreeRTOS (generischer Pico + PCM5102A + MAX9814)
+# 12-Band-Vocoder mit FreeRTOS (generischer Pico + PCM5102A + INMP441)
 
 Schrittweiser Testaufbau Richtung VC16-artiger Vocoder. Portiert vom
 ursprünglichen PicoADK-Aufbau auf einen generischen Raspberry Pi Pico
@@ -16,8 +16,9 @@ Schritt" unten).
 1. **Carrier**: Sägezahn-Wavetable (statt Sinus wie in Schritt 3 - ein
    Sinus liefert nur bei einer Frequenz Energie, ein Vocoder braucht
    Obertöne in allen 12 Bändern). Tonhöhe 80–400Hz, gesteuert vom Poti.
-2. **Modulator**: Mic-Signal (MAX9814/MAX4466-Ausgang) läuft durch 12
-   parallele Analyse-Bandpässe (log-gestaffelt 100Hz–8000Hz, Q=4) →
+2. **Modulator**: Mic-Signal vom INMP441 (digitales I2S-MEMS-Mikrofon,
+   eingelesen per PIO + DMA, siehe unten) läuft durch 12 parallele
+   Analyse-Bandpässe (log-gestaffelt 100Hz–8000Hz, Q=4) →
    Gleichrichter → Attack(3ms)/Release(100ms) → 12 Hüllkurven.
 3. Der Carrier läuft durch 12 Synthese-Bandpässe mit denselben
    Mittenfrequenzen; jedes Band wird mit seiner zugehörigen Hüllkurve
@@ -50,8 +51,9 @@ Schritt" unten).
 
 - I2S-Pins sind frei wählbar (unten), da kein fest verdrahteter
   interner DAC mehr vorliegt - selbst verkabelt statt onboard.
-- Kein ADC128S102/SPI mehr für Poti+Mic - der native RP2040-ADC
-  (GPIO26-28) übernimmt beide Kanäle.
+- Kein ADC128S102/SPI mehr für Poti+Mic: Das Poti liest der native
+  RP2040-ADC (GPIO26), das Mikrofon ist ein digitales INMP441 an einem
+  eigenen PIO-I2S-Empfänger (GPIO10-12).
 - Kein XSMT/DEMP-GPIO-Handling mehr im Code - das übernehmen feste
   Jumper/Lötbrücken auf dem PCM5102A-Breakout selbst (siehe unten).
 - Kein Debug-Logging/Heartbeat-LED mehr aktiv (war während der
@@ -87,34 +89,55 @@ passiert dafür nichts. Falls dein Modul diese Signale stattdessen als
 GPIO-Pins herausführt statt sie zu jumpern, müssten sie wie bei der
 PicoADK-Version per `gpio_init`/`gpio_put` gesetzt werden.
 
-### Nativer RP2040-ADC für Poti und Mic
+### Nativer RP2040-ADC für das Poti
 
 ```
 GPIO26 = ADC0 = Frequenz-Poti  (Schleifer -> GPIO26, Außenbeine -> 3V3/GND)
-GPIO27 = ADC1 = Mic-Amp-Ausgang (MAX9814)
 ```
 
-Kanalzuordnung in `main.cpp` als `POT_ADC_CHANNEL`/`MIC_ADC_CHANNEL`
-änderbar. Wichtig im Code: `adc_select_input()` wird nur beim
-tatsächlichen Kanalwechsel aufgerufen (einmal pro Puffer kurz auf
-Poti, dann fest auf Mic für die gesamte Sample-Schleife) - nicht vor
-jedem einzelnen Read.
+Kanalzuordnung in `main.cpp` als `POT_ADC_CHANNEL` änderbar. Der ADC
+hat nur noch diesen einen Kanal, `adc_select_input()` wird einmal beim
+Setup aufgerufen. GPIO27 (früher Mic-ADC) ist frei.
 
-### MAX9814-Verdrahtung
+### INMP441 (digitales I2S-MEMS-Mikrofon)
 
 ```
-MAX9814 VDD  -> 3V3   (nicht 5V/VBUS - RP2040-ADC verträgt nur bis 3.3V)
-MAX9814 GND  -> GND
-MAX9814 OUT  -> GPIO27
-MAX9814 GAIN -> offen lassen = 60dB (Standard) | VDD = 40dB | GND = 50dB
-MAX9814 A/R  -> offen lassen = 1:4000 (Standard) | VDD = 1:2000 | GND = 1:500
+INMP441 VDD -> 3V3(OUT), Pin 36   (NICHT an VBUS/VSYS - das sind 5V)
+INMP441 GND -> GND, Pin 13
+INMP441 L/R -> GND                (linker Slot - der Empfänger liest nur links)
+INMP441 SCK -> GPIO10, Pin 14     (kMicSckPin)
+INMP441 WS  -> GPIO11, Pin 15     (kMicWsPin, muss SCK + 1 sein)
+INMP441 SD  -> GPIO12, Pin 16     (kMicSdPin, interner Pulldown aktiv)
 ```
 
-Kein zusätzliches Bias-Netzwerk nötig - das Modul liefert bereits ein
-ADC-taugliches, vorgespanntes Signal (Bias laut Datenblatt fest bei
-ca. 1,25V, unabhängig von VDD). Der Bandpass im Code entfernt den
-verbleibenden Rest-Bias automatisch (0 Gain bei DC), exakte
-Zentrierung ist daher nicht kritisch.
+Der RP2040 hat keine I2S-Eingangsschnittstelle; der Empfänger ist ein
+eigenes PIO-Programm (`src/i2s_mic.pio`) auf `pio1` (`pio0` belegt
+pico-extras für den DAC). Der Pico ist I2S-Master und erzeugt SCK und
+WS selbst, exakt 128 PIO-Takte pro Frame, Samplerate = `kSampleRateHz`.
+Eine DMA schreibt die Samples in einen Ringpuffer, die Audio-Schleife
+holt pro Ausgabepuffer einen Block von 256 Samples (`mic_read_block`).
+
+Wichtige Eigenschaften und Hinweise:
+
+- SCK und WS müssen aufeinanderfolgende GPIOs sein (beide per
+  `side_set`), SD ist frei wählbar.
+- Kein Bias-Netzwerk, kein Spannungsteiler, kein Anti-Aliasing-Filter
+  nötig: das Mic liefert vorzeichenbehaftete 24-Bit-Werte um 0 und hat
+  sein eigenes digitales Dezimationsfilter.
+- Kein einstellbarer Gain am Modul: Die Pegelanpassung macht die
+  Software über `kMicGainShift` (jede Stufe = 6 dB).
+- Empfindlichkeit laut Datenblatt −26 dBFS ±1 dB - ein zweites
+  Exemplar liefert praktisch dieselben Pegel, kein Abgleich pro
+  Platine nötig.
+- Leitungen kurz halten (< 15 cm), GND-Draht neben SCK führen und
+  räumlich getrennt von den DAC-Leitungen (GPIO16-18) verlegen.
+- Die ersten ~85 ms nach dem Start liefert das INMP441 noch keine
+  gültigen Daten.
+- Nur stromlos verkabeln. Vor dem ersten Einschalten 3V3 gegen GND
+  messen: einige kΩ sind normal, wenige Ω wären ein Kurzschluss.
+
+Isolierter Funktionstest ohne FreeRTOS/Vocoder: Projekt
+[hello_mic_test](https://github.com/wehrend/hello_mic_test).
 
 ### Analog-Ausgang
 
@@ -179,16 +202,16 @@ beim Einstecken gedrückt halten) anschließen, `.uf2` draufkopieren.
   I2S-Konfiguration passen.
 - **Knacken in regelmäßigen Abständen:** `kBufferSamples` erhöhen oder
   Pufferanzahl in `audio_new_producer_pool()` (aktuell 3) erhöhen.
-- **Hüllkurve reagiert kaum/übersteuert sofort:** Skalierungsfaktor
-  `6.0f` vor dem Clipping in `main()` ist ein grober Platzhalter -
-  hängt von Mic-Gain (MAX9814 GAIN-Pin: 40/50/60dB) und Sprechabstand
-  ab. Bei Bedarf `printf` für den rohen `envelope`-Wert temporär wieder
-  einbauen und Faktor so einstellen, dass er bei normaler
-  Sprechlautstärke nahe 1.0 bleibt, ohne dauerhaft zu clippen.
-- **Bandpass scheint nichts zu tun:** Mic-Read + Filter müssen **pro
-  Sample** laufen, nicht einmal pro Puffer (das Poti darf das, Audio
-  nicht) - in `main.cpp` prüfen, dass das innerhalb der
-  Sample-Schleife passiert.
+- **Mic-Werte bleiben bei 0, auch beim Klopfen:** L/R des INMP441 nicht
+  auf GND, SD falsch verkabelt oder Mic ohne Versorgung.
+- **Mic-Werte springen wild auf riesige Werte, auch in Stille:**
+  Bit-Ausrichtung (das I2S-Verzögerungsbit wird per `raw << 1`
+  entfernt), fehlender Pulldown an SD oder zu lange Leitungen.
+- **Mic reagiert, aber zu leise/übersteuert:** `kMicGainShift` anpassen
+  (+1 = +6 dB). Ziel: normale Sprache mit Spitzen um 200–500/1000 in
+  `micMin`/`micMax` der Diagnose.
+- **Diagnose `mic: under`/`over` zählt ständig hoch:** Füllstand des
+  Mic-Ringpuffers läuft aus dem Ruder; `kMicTargetFill` prüfen.
 
 ## Nächster Schritt
 
