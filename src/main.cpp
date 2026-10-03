@@ -205,11 +205,16 @@ VocoderBandFixed bands[kNumBands];
 // zur SYNTHESE-Seite jetzt mit Rauschmix (recht gleichmäßige Energie
 // übers Spektrum) - erst den Rauschmix isoliert prüfen, dann ggf.
 // neu gewichten.
-constexpr float kBandOutputGain[kNumBands] = {
-    0.45f, 0.5f, 0.7f, 1.0f, 1.5f, 2.2f, 3.4f, 5.0f, 7.5f, 14.0f
-}; // gleicht den GEMESSENEN Frequenzgang des Sägezahn-Carriers aus (110 Hz,
-   // Synthese-Q 2: outAvg/bandsAvg pro Band, ~-5 dB/Oktave) - siehe DEVLOG,
-   // Tag vokale-hoerbar. Bei anderem Carrier/Tonhöhenbereich neu messen. // zurückgesetzt - die Gewichtung hat den einzigen bisher gehörten iii/uuu-Unterschied wieder verwischt, siehe DEVLOG Nachtrag 58
+// Bandgewichtung. Der Carrier (Impulszug stimmhaft, weißes Rauschen
+// stimmlos) hat gleiche Leistung pro Hz, in Constant-Q-Bändern also
+// +3 dB/Oktave. Ausgleich analytisch: Gewicht = sqrt(kBandTiltRefHz / f)
+// (siehe setup in audioTask). Simulation: alle Bänder dann bei ~0.09,
+// für Impulse UND Rauschen gleich. kBandOutputGain bleibt als
+// zusätzlicher, manueller Feinabgleich pro Band (Standard 1.0).
+// (Vorher: gemessene Sägezahn-Korrektur 0.45..14 - passte nur zum
+// Sägezahn und hob weißes Rauschen bei "sss" um ~+28 dB zu stark an.)
+constexpr float kBandOutputGain[kNumBands] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+constexpr float kBandTiltRefHz = 365.0f; // Band 3 behält Gewicht 1.0
 q16 g_bandOutputGainQ16[kNumBands];
 
 // DIAGNOSE-SCHALTER: -1 = normaler Mix aller Bänder. 0..kNumBands-1 =
@@ -537,8 +542,8 @@ q16 g_compEnvelope = 0;
 // Sprach-Mittelwert) wirken wie ein Expander und schneiden leise
 // Anteile zwischen Silben weg - das war vermutlich ein Teil dessen,
 // was die Baseline "knackiger" klingen ließ.
-constexpr float kGateOpenThreshold  = 0.060f;
-constexpr float kGateCloseThreshold = 0.030f;
+constexpr float kGateOpenThreshold  = 0.040f; // war 0.060 - "fff" lag mit 0.042-0.048 darunter
+constexpr float kGateCloseThreshold = 0.020f; // war 0.030 - IN STILLE PRÜFEN: gateDet max muss darunter bleiben
 constexpr float kGateDetAttackMs    = 5.0f;
 constexpr float kGateDetReleaseMs   = 50.0f;
 constexpr float kGateAttackMs   = 5.0f;
@@ -588,6 +593,15 @@ q16 g_outputLowpassState = 0;
 // Läuft auf Core0 VOR dem Start der Bänder, weil Analyse (Pre-Emphasis)
 // und Synthese (Carrier) beider Kerne davon abhängen.
 // =====================================================================
+// Rumpelfilter (Hochpass 80 Hz, Butterworth) VOR allem anderen: Bei
+// leisen Lauten (sch, f) schwankte der Mic-Pegel tieffrequent stark
+// (Atem/Luftstrom aufs Mic, micDc -0.09..-0.22) - das landete voll im
+// 1.5-kHz-Tiefpass der Erkennung und überstimmte den leisen Hochton-
+// anteil (sch: 0-16% stimmlos trotz Energie fast nur > 2 kHz). Im
+// Browser entfernt der Mic-Eingang solches Rumpeln. Keine Sprach-
+// information unter 80 Hz.
+constexpr float kRumbleHighpassHz   = 80.0f;
+constexpr float kButterworthQDb     = -3.0103f; // Q = 0.7071 linear, Web-Audio-Q in dB
 constexpr float kTrebleBoostDb      = 6.0f;    // trebleBoost-Default der Referenz
 constexpr float kTrebleShelfHz      = 2000.0f;
 constexpr float kVuvSwitchHz        = 1500.0f; // SWITCH_FREQUENCY
@@ -598,7 +612,17 @@ constexpr float kVuvSwitchSmoothingS   = 0.01f;  // SWITCH_SMOOTHING
 // (weiß, etwa ±1). next_noise_q16() liefert ±0.5 -> x2. Nach Gehör bzw.
 // über outAvg bei "sss" nachjustieren.
 constexpr float kUnvoicedNoiseGain  = 2.0f;
+// Stimmhafter Carrier: Impulszug (historischer Vocoder-Carrier) statt
+// Sägezahn. Ein Impuls der Höhe h pro Periode hat dieselbe Leistung pro
+// Hz wie weißes Rauschen mit Standardabweichung sigma, wenn
+//   h = sigma * sqrt(fs / f0)
+// (sigma = 1/sqrt(3) für gleichverteiltes Rauschen ±1). Dadurch kommen
+// Vokale und Zischlaute über dieselbe Bandgewichtung gleich laut heraus,
+// unabhängig von der Tonhöhe. Simulation: Abweichung pro Band < 1 dB.
+// kVoicedLevel: manueller Feinabgleich Vokale gegen Zischlaute.
+constexpr float kVoicedLevel = 1.0f;
 
+BiquadGeneralFixed g_rumbleHighpass;
 BiquadGeneralFixed g_trebleShelf;
 BiquadGeneralFixed g_vuvHighpass;
 BiquadGeneralFixed g_vuvLowpass;
@@ -616,6 +640,7 @@ q16 g_fadeSin[kFadeTableSize + 1];
 
 void setup_voiced_unvoiced() {
     const float fs = (float)kSampleRateHz;
+    g_rumbleHighpass.setHighpass(kRumbleHighpassHz, kButterworthQDb, fs);
     g_trebleShelf.setHighShelf(kTrebleShelfHz, kTrebleBoostDb, fs);
     g_vuvHighpass.setHighpass(kVuvSwitchHz, kVuvFilterQDb, fs);
     g_vuvLowpass.setLowpass(kVuvSwitchHz, kVuvFilterQDb, fs);
@@ -745,7 +770,10 @@ void audioTask(void *) {
     g_noiseShapeCoeff = float_to_q16(1.0f - expf(-2.0f * (float)M_PI * kNoiseShapeFreqHz / (float)kSampleRateHz));
     for (int b = 0; b < kNumBands; ++b) {
         // Referenz-Boost x100 hier mit eingerechnet (VCA-Verstärkung).
-        g_bandOutputGainQ16[b] = float_to_q16(kBandOutputGain[b] * (float)kAnalysisGainBoost);
+        float t = (kNumBands == 1) ? 0.0f : (float)b / (float)(kNumBands - 1);
+        float freq = kBandFreqLowHz * powf(kBandFreqHighHz / kBandFreqLowHz, t);
+        float tilt = sqrtf(kBandTiltRefHz / freq);
+        g_bandOutputGainQ16[b] = float_to_q16(kBandOutputGain[b] * tilt * (float)kAnalysisGainBoost);
     }
     g_micDcUpdateRate = kQ16One - float_to_q16(expf(-1.0f / (0.001f * kMicDcTrackingMs * (float)kSampleRateHz)));
 
@@ -838,7 +866,7 @@ void audioTask(void *) {
         xQueueOverwrite(g_potRawQueue, &potNorm);
         xQueueReceive(g_carrierFreqQueue, &carrierHz, 0);
         uint32_t phaseInc = (uint32_t)((carrierHz * kCarrierTableSize / (float)kSampleRateHz) * 65536.0f);
-        adc_select_input(MIC_ADC_CHANNEL);
+
         uint64_t waitStartUs = time_us_64();
         audio_buffer_t *buf = take_audio_buffer(pool, true);
         uint64_t waitUs = time_us_64() - waitStartUs;
@@ -859,6 +887,9 @@ void audioTask(void *) {
         // 1) Carrier-Block für den ganzen Puffer vorbereiten (Phase,
         //    Rausch-Formung - zustandsbehaftet, darum nur auf Core0).
         uint64_t prepStartUs = time_us_64();
+        // Impulshöhe für gleiche Leistungsdichte wie das Rauschen (s.o.).
+        q16 impulseHeightQ16 = float_to_q16(kVoicedLevel * (1.0f / sqrtf(3.0f)) *
+                                            sqrtf((float)kSampleRateHz / carrierHz));
         for (uint32_t i = 0; i < kBufferSamples; ++i) {
             q16 micQ16 = sMicBlock[i];
             if (micQ16 < sMicMinQ16) sMicMinQ16 = micQ16;
@@ -866,7 +897,8 @@ void audioTask(void *) {
 
             // Pre-Emphasis (trebleBoost): ab hier ist das der Modulator
             // für die Analyse auf beiden Kernen.
-            q24 speech = g_trebleShelf.processQ24(micQ16 << (kQ24Frac - kQ16Frac));
+            q24 deRumbled = g_rumbleHighpass.processQ24(micQ16 << (kQ24Frac - kQ16Frac));
+            q24 speech = g_trebleShelf.processQ24(deRumbled);
             sMicBlock[i] = speech >> (kQ24Frac - kQ16Frac);
 
             // Erkennung: Hochpass- gegen Tiefpass-Pegel bei 1.5 kHz.
@@ -881,7 +913,10 @@ void audioTask(void *) {
             if (unvoiced) ++sUnvoicedSamples;
 
             // Carrier: Sägezahn (stimmhaft) <-> weißes Rauschen (stimmlos).
-            q16 sawQ16 = carrierTable[(phase >> 16) & (kCarrierTableSize - 1)];
+            // Impulszug: ein Impuls bei jedem Phasenüberlauf, sonst 0.
+            uint32_t idxNow  = (phase >> 16) & (kCarrierTableSize - 1);
+            uint32_t idxNext = ((phase + phaseInc) >> 16) & (kCarrierTableSize - 1);
+            q16 sawQ16 = (idxNext < idxNow) ? impulseHeightQ16 : 0; // (Name historisch: war Sägezahn)
             q16 noiseQ16 = next_noise_q16();
             // Alter fester Rauschanteil (kCarrierNoiseMix, jetzt 0) bleibt
             // als Pfad erhalten, damit er sich zum Vergleich zuschalten lässt.
