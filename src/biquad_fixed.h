@@ -87,3 +87,81 @@ struct BiquadFixed {
         return processQ24(x << (kQ24Frac - kQ16Frac)) >> (kQ24Frac - kQ16Frac);
     }
 };
+
+// === Allgemeiner Biquad (für Shelf/Tiefpass/Hochpass des Stimmhaft/
+// Stimmlos-Moduls, siehe main.cpp und modular-synth VoicedUnvoicedNode).
+// Formeln wie Web Audio BiquadFilterNode (Audio-EQ-Cookbook), damit die
+// Filter der Referenz exakt nachgebildet werden. Wichtig: Web Audio
+// interpretiert Q bei Tief-/Hochpass in dB (Tone-Default Q=1 -> 10^(1/20)
+// = 1.122 linear), bei Bandpass dagegen linear.
+// Koeffizienten in Q3.29 (Bereich ±4 - Shelf-Filter brauchen b0 > 2),
+// Zustand/Ein-/Ausgang in Q8.24 wie BiquadFixed. Transponierte
+// Direktform II.
+constexpr int kQ29Frac = 29;
+
+inline int32_t float_to_q29(float f) {
+    double v = (double)f * (double)(1ll << kQ29Frac);
+    if (v >  2147483647.0) v =  2147483647.0;
+    if (v < -2147483648.0) v = -2147483648.0;
+    return (int32_t)llround(v);
+}
+
+inline q24 q29_mul_q24(int32_t coeff, q24 x) {
+    return (q24)(((int64_t)coeff * (int64_t)x) >> kQ29Frac);
+}
+
+struct BiquadGeneralFixed {
+    int32_t b0 = 0, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+    q24 z1 = 0, z2 = 0;
+
+    void setNormalized(float nb0, float nb1, float nb2, float na0, float na1, float na2) {
+        b0 = float_to_q29(nb0 / na0);
+        b1 = float_to_q29(nb1 / na0);
+        b2 = float_to_q29(nb2 / na0);
+        a1 = float_to_q29(na1 / na0);
+        a2 = float_to_q29(na2 / na0);
+    }
+
+    // qDb: Q wie in Web Audio in dB (Tone.Filter-Default: 1).
+    void setLowpass(float freqHz, float qDb, float sampleRate) {
+        float w0 = 2.0f * (float)M_PI * freqHz / sampleRate;
+        float cw = cosf(w0);
+        float alpha = sinf(w0) / (2.0f * powf(10.0f, qDb / 20.0f));
+        setNormalized((1.0f - cw) / 2.0f, 1.0f - cw, (1.0f - cw) / 2.0f,
+                      1.0f + alpha, -2.0f * cw, 1.0f - alpha);
+    }
+
+    void setHighpass(float freqHz, float qDb, float sampleRate) {
+        float w0 = 2.0f * (float)M_PI * freqHz / sampleRate;
+        float cw = cosf(w0);
+        float alpha = sinf(w0) / (2.0f * powf(10.0f, qDb / 20.0f));
+        setNormalized((1.0f + cw) / 2.0f, -(1.0f + cw), (1.0f + cw) / 2.0f,
+                      1.0f + alpha, -2.0f * cw, 1.0f - alpha);
+    }
+
+    // High-Shelf wie Web Audio (Steilheit S = 1, Q wird ignoriert).
+    void setHighShelf(float freqHz, float gainDb, float sampleRate) {
+        float A = powf(10.0f, gainDb / 40.0f);
+        float w0 = 2.0f * (float)M_PI * freqHz / sampleRate;
+        float cw = cosf(w0);
+        float alpha = sinf(w0) / 2.0f * sqrtf(2.0f); // S = 1
+        float sqA2a = 2.0f * sqrtf(A) * alpha;
+        setNormalized(A * ((A + 1.0f) + (A - 1.0f) * cw + sqA2a),
+                      -2.0f * A * ((A - 1.0f) + (A + 1.0f) * cw),
+                      A * ((A + 1.0f) + (A - 1.0f) * cw - sqA2a),
+                      (A + 1.0f) - (A - 1.0f) * cw + sqA2a,
+                      2.0f * ((A - 1.0f) - (A + 1.0f) * cw),
+                      (A + 1.0f) - (A - 1.0f) * cw - sqA2a);
+    }
+
+    inline q24 processQ24(q24 x) {
+        q24 y = q29_mul_q24(b0, x) + z1;
+        z1 = q29_mul_q24(b1, x) - q29_mul_q24(a1, y) + z2;
+        z2 = q29_mul_q24(b2, x) - q29_mul_q24(a2, y);
+        return y;
+    }
+
+    inline q16 process(q16 x) {
+        return processQ24(x << (kQ24Frac - kQ16Frac)) >> (kQ24Frac - kQ16Frac);
+    }
+};

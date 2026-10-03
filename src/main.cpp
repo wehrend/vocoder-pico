@@ -243,7 +243,7 @@ inline q16 next_noise_q16() {
 // garantiert echte, unterscheidbare Substanz zum Formen. Noch KEINE
 // Stimmhaft/Unstimmhaft-Umschaltung (das wäre der nächste, feinere
 // Schritt) - erstmal ein fester Mix, um die Grundidee zu testen.
-constexpr float kCarrierNoiseMix = 0.4f;
+constexpr float kCarrierNoiseMix = 0.0f; // war 0.4 - ersetzt durch die Stimmhaft/Stimmlos-Umschaltung (Referenz: VoicedUnvoicedNode), Pfad bleibt zum Vergleich erhalten
 q16 g_carrierNoiseMixQ16 = 0;
 
 // "Rosa" statt weißes Rauschen - siehe DEVLOG Nachtrag 56: weißes
@@ -575,6 +575,65 @@ q16 g_outputLowpassState = 0;
 
 
 // =====================================================================
+// STIMMHAFT/STIMMLOS (Nachbau von modular-synth VoicedUnvoicedNode.tsx,
+// vgl. Doepfer A-129/5):
+//   Mic -> High-Shelf +6 dB @ 2 kHz ("trebleBoost", Default 6) -> das
+//   ist zugleich das Modulatorsignal für die Analyse (Pre-Emphasis).
+//   Erkennung: Hochpass- und Tiefpass-Pegel bei 1.5 kHz (Tone.Filter,
+//   Q-Default 1 dB), je Tone.Follower(0.015) = Tiefpass 66.7 Hz
+//   (tau 2.4 ms). Hochpass-Pegel > Tiefpass-Pegel -> stimmlos (hart 0/1),
+//   geglättet mit Tone.Follower(0.01) (tau 1.6 ms) gegen Klicks.
+//   Carrier: gleichstarke Überblendung (Tone.CrossFade) zwischen
+//   Sägezahn (stimmhaft) und weißem Rauschen (stimmlos, Tone.Noise).
+// Läuft auf Core0 VOR dem Start der Bänder, weil Analyse (Pre-Emphasis)
+// und Synthese (Carrier) beider Kerne davon abhängen.
+// =====================================================================
+constexpr float kTrebleBoostDb      = 6.0f;    // trebleBoost-Default der Referenz
+constexpr float kTrebleShelfHz      = 2000.0f;
+constexpr float kVuvSwitchHz        = 1500.0f; // SWITCH_FREQUENCY
+constexpr float kVuvFilterQDb       = 1.0f;    // Tone.Filter-Default (Web Audio: Q in dB)
+constexpr float kVuvDetectorSmoothingS = 0.015f; // DETECTOR_SMOOTHING
+constexpr float kVuvSwitchSmoothingS   = 0.01f;  // SWITCH_SMOOTHING
+// Pegel des Rauschens im stimmlosen Fall. Die Referenz nutzt Tone.Noise
+// (weiß, etwa ±1). next_noise_q16() liefert ±0.5 -> x2. Nach Gehör bzw.
+// über outAvg bei "sss" nachjustieren.
+constexpr float kUnvoicedNoiseGain  = 2.0f;
+
+BiquadGeneralFixed g_trebleShelf;
+BiquadGeneralFixed g_vuvHighpass;
+BiquadGeneralFixed g_vuvLowpass;
+q16 g_vuvDetectorCoeff = 0;  // 1 - exp(-1/(tau*fs))
+q16 g_vuvSwitchCoeff = 0;
+q24 g_vuvHighEnv = 0;
+q24 g_vuvLowEnv = 0;
+q16 g_vuvFade = 0;           // 0 = stimmhaft (Sägezahn), 1 = stimmlos (Rauschen)
+q16 g_unvoicedNoiseGainQ16 = 0;
+
+// Gleichstarke Überblendung wie Tone.CrossFade: a*cos(f*pi/2) + b*sin(f*pi/2).
+constexpr int kFadeTableSize = 256;
+q16 g_fadeCos[kFadeTableSize + 1];
+q16 g_fadeSin[kFadeTableSize + 1];
+
+void setup_voiced_unvoiced() {
+    const float fs = (float)kSampleRateHz;
+    g_trebleShelf.setHighShelf(kTrebleShelfHz, kTrebleBoostDb, fs);
+    g_vuvHighpass.setHighpass(kVuvSwitchHz, kVuvFilterQDb, fs);
+    g_vuvLowpass.setLowpass(kVuvSwitchHz, kVuvFilterQDb, fs);
+    // Tone.Follower(s) = einpoliger Tiefpass mit Grenzfrequenz 1/s,
+    // also Zeitkonstante tau = s / (2*pi).
+    float tauDet = kVuvDetectorSmoothingS / (2.0f * (float)M_PI);
+    float tauSw  = kVuvSwitchSmoothingS / (2.0f * (float)M_PI);
+    g_vuvDetectorCoeff = kQ16One - float_to_q16(expf(-1.0f / (tauDet * fs)));
+    g_vuvSwitchCoeff   = kQ16One - float_to_q16(expf(-1.0f / (tauSw * fs)));
+    g_unvoicedNoiseGainQ16 = float_to_q16(kUnvoicedNoiseGain);
+    for (int k = 0; k <= kFadeTableSize; ++k) {
+        float a = (float)k / (float)kFadeTableSize * (float)M_PI * 0.5f;
+        g_fadeCos[k] = float_to_q16(cosf(a));
+        g_fadeSin[k] = float_to_q16(sinf(a));
+    }
+}
+
+// =====================================================================
 // ZWEITER KERN (siehe DEVLOG, Kapitel 5 im Artikel: gleiches Muster wie
 // damals). Core1 läuft als eigene Endlosschleife AUSSERHALB von
 // FreeRTOS und rechnet die obere Hälfte der Bänder. Zwei Handshakes pro
@@ -682,6 +741,7 @@ void audioTask(void *) {
         bands[b].synthesisFilter.setBandpass(freq, kSynthesisQ, (float)kSampleRateHz);
     }
     g_carrierNoiseMixQ16 = float_to_q16(kCarrierNoiseMix);
+    setup_voiced_unvoiced();
     g_noiseShapeCoeff = float_to_q16(1.0f - expf(-2.0f * (float)M_PI * kNoiseShapeFreqHz / (float)kSampleRateHz));
     for (int b = 0; b < kNumBands; ++b) {
         // Referenz-Boost x100 hier mit eingerechnet (VCA-Verstärkung).
@@ -751,6 +811,8 @@ void audioTask(void *) {
     // Zweikern-Diagnose: Rechenzeit der Core0-Bänder und wie lange Core0
     // danach noch auf Core1 warten musste (beides gemittelt pro Puffer).
     static uint64_t sCore0BandsSumUs = 0;
+    static uint64_t sPrepSumUs = 0;      // Pre-Emphasis + Erkennung + Carrier (seriell, Core0)
+    static uint32_t sUnvoicedSamples = 0; // Anteil "stimmlos" im Fenster
     static uint64_t sCore1ExtraWaitSumUs = 0;
     static int64_t sGateDetSum = 0;
     static q16 sGateDetMaxQ16 = 0;
@@ -796,16 +858,43 @@ void audioTask(void *) {
 
         // 1) Carrier-Block für den ganzen Puffer vorbereiten (Phase,
         //    Rausch-Formung - zustandsbehaftet, darum nur auf Core0).
+        uint64_t prepStartUs = time_us_64();
         for (uint32_t i = 0; i < kBufferSamples; ++i) {
             q16 micQ16 = sMicBlock[i];
             if (micQ16 < sMicMinQ16) sMicMinQ16 = micQ16;
             if (micQ16 > sMicMaxQ16) sMicMaxQ16 = micQ16;
-            q16 carrierQ16 = carrierTable[(phase >> 16) & (kCarrierTableSize - 1)];
+
+            // Pre-Emphasis (trebleBoost): ab hier ist das der Modulator
+            // für die Analyse auf beiden Kernen.
+            q24 speech = g_trebleShelf.processQ24(micQ16 << (kQ24Frac - kQ16Frac));
+            sMicBlock[i] = speech >> (kQ24Frac - kQ16Frac);
+
+            // Erkennung: Hochpass- gegen Tiefpass-Pegel bei 1.5 kHz.
+            q24 hp = g_vuvHighpass.processQ24(speech);
+            q24 lp = g_vuvLowpass.processQ24(speech);
+            q24 hpAbs = (hp < 0) ? -hp : hp;
+            q24 lpAbs = (lp < 0) ? -lp : lp;
+            g_vuvHighEnv += (q24)(((int64_t)g_vuvDetectorCoeff * (hpAbs - g_vuvHighEnv)) >> kQ16Frac);
+            g_vuvLowEnv  += (q24)(((int64_t)g_vuvDetectorCoeff * (lpAbs - g_vuvLowEnv)) >> kQ16Frac);
+            q16 unvoiced = (g_vuvHighEnv > g_vuvLowEnv) ? kQ16One : 0;  // GreaterThan(0)
+            g_vuvFade += q16_mul(g_vuvSwitchCoeff, unvoiced - g_vuvFade);
+            if (unvoiced) ++sUnvoicedSamples;
+
+            // Carrier: Sägezahn (stimmhaft) <-> weißes Rauschen (stimmlos).
+            q16 sawQ16 = carrierTable[(phase >> 16) & (kCarrierTableSize - 1)];
             q16 noiseQ16 = next_noise_q16();
+            // Alter fester Rauschanteil (kCarrierNoiseMix, jetzt 0) bleibt
+            // als Pfad erhalten, damit er sich zum Vergleich zuschalten lässt.
             g_noiseShapeState = g_noiseShapeState + q16_mul(g_noiseShapeCoeff, noiseQ16 - g_noiseShapeState);
-            g_carrierBlock[i] = carrierQ16 + q16_mul(g_carrierNoiseMixQ16, g_noiseShapeState - carrierQ16);
+            q16 voicedQ16 = sawQ16 + q16_mul(g_carrierNoiseMixQ16, g_noiseShapeState - sawQ16);
+            q16 unvoicedQ16 = q16_mul(noiseQ16, g_unvoicedNoiseGainQ16);
+            int fadeIdx = (int)(((int64_t)g_vuvFade * kFadeTableSize) >> kQ16Frac);
+            if (fadeIdx < 0) fadeIdx = 0;
+            if (fadeIdx > kFadeTableSize) fadeIdx = kFadeTableSize;
+            g_carrierBlock[i] = q16_mul(voicedQ16, g_fadeCos[fadeIdx]) + q16_mul(unvoicedQ16, g_fadeSin[fadeIdx]);
             phase += phaseInc;
         }
+        sPrepSumUs += (uint32_t)(time_us_64() - prepStartUs);
 
         // 2) Core1 starten (obere Bänder), Core0 rechnet parallel die unteren.
         __dmb();
@@ -909,6 +998,9 @@ void audioTask(void *) {
                    (unsigned long)sLastMicFill, (unsigned long)kMicTargetFill,
                    (unsigned long)g_micUnderruns, (unsigned long)g_micOverruns,
                    (unsigned long)(sMicWaitSumUs / sBufferCount));
+            printf("  vuv: stimmlos=%lu%% prep=%luus\n",
+                   (unsigned long)((uint64_t)sUnvoicedSamples * 100 / ((uint64_t)sBufferCount * kBufferSamples)),
+                   (unsigned long)(sPrepSumUs / sBufferCount));
             printf("  cores: core0Bands=%luus core1Warten=%luus (Core1 rechnet Bänder %d..%d)\n",
                    (unsigned long)(sCore0BandsSumUs / sBufferCount),
                    (unsigned long)(sCore1ExtraWaitSumUs / sBufferCount),
@@ -957,6 +1049,8 @@ void audioTask(void *) {
             }
             sMicWaitSumUs = 0;
             sCore0BandsSumUs = 0;
+            sPrepSumUs = 0;
+            sUnvoicedSamples = 0;
             sCore1ExtraWaitSumUs = 0;
             sGateDetSum = 0;
             sGateDetMaxQ16 = 0;
