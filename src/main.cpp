@@ -838,7 +838,7 @@ void audioTask(void *) {
         xQueueOverwrite(g_potRawQueue, &potNorm);
         xQueueReceive(g_carrierFreqQueue, &carrierHz, 0);
         uint32_t phaseInc = (uint32_t)((carrierHz * kCarrierTableSize / (float)kSampleRateHz) * 65536.0f);
-
+        adc_select_input(MIC_ADC_CHANNEL);
         uint64_t waitStartUs = time_us_64();
         audio_buffer_t *buf = take_audio_buffer(pool, true);
         uint64_t waitUs = time_us_64() - waitStartUs;
