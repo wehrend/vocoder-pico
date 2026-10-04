@@ -1129,7 +1129,7 @@ int main() {
     xTaskCreate(controlTask, "control", 512, nullptr, /*priority=*/1, nullptr);
 
     vTaskStartScheduler();
-
+git 
     panic("vTaskStartScheduler() zurueckgekehrt - Heap zu klein?");
     return 0;
 }
