@@ -119,6 +119,18 @@ constexpr uint kMicSckPin = 10;
 constexpr uint kMicWsPin  = 11;
 constexpr uint kMicSdPin  = 12;
 
+// Bedienung (siehe DEVLOG, Branch feature/carrier-waveforms):
+// Taster schaltet die Carrier-Wellenform weiter, die Onboard-LED zeigt
+// die gewählte Wellenform als Blinkcode (1x = Impulszug, 2x = Sägezahn,
+// 3x = Rechteck, 4x = Rauschen), danach Pause.
+// Taster: GP14 (Pin 19) gegen GND (Pin 18 direkt daneben), interner
+// Pullup -> gedrückt = 0. 6x6-Taster am besten DIAGONAL anschließen
+// (dann ist die Einbaurichtung egal, siehe DEVLOG).
+// LED: GP25 ist die Onboard-LED des Pico (NICHT beim Pico W - dort hängt
+// die LED am WLAN-Chip).
+constexpr uint kWaveButtonPin = 14;
+constexpr uint kStatusLedPin  = 25;
+
 // Carrier-Tonhöhenbereich - unverändert.
 // ZURÜCKGESETZT auf 80Hz (siehe DEVLOG Nachtrag 31): die Einengung auf
 // 150/200Hz war eine Reaktion auf Kontamination, die zumindest teilweise
@@ -488,6 +500,45 @@ void mic_read_block(q16 *out, uint32_t n) {
     g_micReadIdx = (g_micReadIdx + n) & kMicRingMask;
 }
 
+
+// =====================================================================
+// CARRIER-WELLENFORMEN mit Pegel- und Spektralabgleich
+// =====================================================================
+// Alle stimmhaften Carrier werden so angepasst, dass sie im Formant-
+// bereich (Bänder 4..7, ~580-2400 Hz) dieselbe Leistung pro Band
+// liefern wie das weiße Rauschen für die Zischlaute. Nur dann passt
+// EINE Bandgewichtung (sqrt(365/f)) für alle Wellenformen, und Vokale
+// und Zischlaute bleiben im Gleichgewicht (siehe DEVLOG: der rohe
+// Sägezahn fiel um ~6 dB/Oktave ab, die hohen Formanten lagen 20-60 dB
+// unter dem Grundton -> keine Vokalunterschiede hörbar).
+//
+// Sägezahn und Rechteck: Höhenanhebung y[n] = x[n] - a*x[n-1] mit
+// a = kWavePreEmphasis, danach Skalierung * sqrt(110 Hz / f0).
+// Simulation (gleiche Filter/Tabellen wie hier, Q=2, f0 = 110/200 Hz):
+// ab ~365 Hz innerhalb ±1 dB am Rauschen; die untersten Bänder behalten
+// etwas mehr Bass - das ist der Charakter, der die Wellenformen dort
+// unterscheidet. Oberhalb ~400 Hz klingen Sägezahn und Impulszug nach
+// dem Vocoder sehr ähnlich (beide: alle Obertöne, flach); das Rechteck
+// unterscheidet sich hörbar (nur ungerade Obertöne -> "hohl").
+enum CarrierWave : uint8_t {
+    kWaveImpulse = 0,
+    kWaveSaw     = 1,
+    kWaveSquare  = 2,
+    kWaveNoise   = 3,   // nur Rauschen -> Flüsterstimme
+    kWaveCount   = 4
+};
+const char *const kWaveNames[kWaveCount] = {"Impulszug", "Saegezahn", "Rechteck", "Rauschen"};
+
+constexpr float kWavePreEmphasis   = 0.9f;
+constexpr float kWaveRefHz         = 110.0f;
+constexpr float kSawLevelAtRef     = 4.00f;  // Simulation: Abgleich auf Rauschen, Bänder 4..7
+constexpr float kSquareLevelAtRef  = 2.81f;
+
+q16 g_wavePreEmphasisQ16 = 0;
+q16 g_sawPrev = 0;      // letzter Rohwert für die Höhenanhebung
+q16 g_squarePrev = 0;
+QueueHandle_t g_waveQueue = nullptr;
+
 // Queues zur Kommunikation zwischen audioTask (ADC-Besitzer) und
 // controlTask (Glättung/Mapping) - unverändert aus dem Vocoder-Projekt.
 QueueHandle_t g_potRawQueue = nullptr;
@@ -542,8 +593,8 @@ q16 g_compEnvelope = 0;
 // Sprach-Mittelwert) wirken wie ein Expander und schneiden leise
 // Anteile zwischen Silben weg - das war vermutlich ein Teil dessen,
 // was die Baseline "knackiger" klingen ließ.
-constexpr float kGateOpenThreshold  = 0.040f; // war 0.060 - "fff" lag mit 0.042-0.048 darunter
-constexpr float kGateCloseThreshold = 0.020f; // war 0.030 - IN STILLE PRÜFEN: gateDet max muss darunter bleiben
+constexpr float kGateOpenThreshold  = 0.015f; // war 0.040 - Stille nach Rumpelfilter max. ~0.001, "fff" ~0.03
+constexpr float kGateCloseThreshold = 0.008f; // war 0.020 - weiterhin ~8x über den Stille-Spitzen
 constexpr float kGateDetAttackMs    = 5.0f;
 constexpr float kGateDetReleaseMs   = 50.0f;
 constexpr float kGateAttackMs   = 5.0f;
@@ -732,6 +783,28 @@ void core1_entry() {
 
 void controlTask(void *) {
     float smoothedHz = 220.0f;
+
+    // Taster (GP14, Pullup -> gedrückt = 0) und Status-LED (GP25).
+    gpio_init(kWaveButtonPin);
+    gpio_set_dir(kWaveButtonPin, GPIO_IN);
+    gpio_pull_up(kWaveButtonPin);
+    gpio_init(kStatusLedPin);
+    gpio_set_dir(kStatusLedPin, GPIO_OUT);
+
+    uint8_t wave = kWaveImpulse;
+    xQueueOverwrite(g_waveQueue, &wave);
+
+    // Entprellung: Zustand muss zwei Abfragen (~40 ms) stabil sein.
+    bool stablePressed = false;
+    bool lastRaw = false;
+    // Blinkcode: (wave+1) kurze Blitze, dann Pause - zeitgesteuert über
+    // den FreeRTOS-Tick, unabhängig von der Schleifendauer.
+    constexpr TickType_t kBlinkOn    = pdMS_TO_TICKS(120);
+    constexpr TickType_t kBlinkOff   = pdMS_TO_TICKS(180);
+    constexpr TickType_t kBlinkPause = pdMS_TO_TICKS(900);
+    TickType_t blinkPhaseStart = xTaskGetTickCount();
+    int blinkStep = 0;   // 0..2*(wave+1)-1: an/aus im Wechsel, danach Pause
+
     for (;;) {
         float potNorm;
         if (xQueueReceive(g_potRawQueue, &potNorm, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -739,6 +812,38 @@ void controlTask(void *) {
             smoothedHz += (targetHz - smoothedHz) * 0.2f;
             xQueueOverwrite(g_carrierFreqQueue, &smoothedHz);
         }
+
+        // --- Taster ---
+        bool raw = !gpio_get(kWaveButtonPin);
+        // DEBUG: jeden Pegelwechsel an GP14 ausgeben
+        if (raw != lastRaw) {
+            printf("[Taster] GP14 %s (Pin-Pegel=%d)\n",
+                   raw ? "GEDRUECKT" : "losgelassen", (int)gpio_get(kWaveButtonPin));
+        }
+        xQueueOverwrite(g_waveQueue, &wave);
+        if (raw == lastRaw && raw != stablePressed) {
+            stablePressed = raw;
+            if (stablePressed) {  // Flanke "gedrückt" -> nächste Wellenform
+                wave = (uint8_t)((wave + 1) % kWaveCount);
+                xQueueOverwrite(g_waveQueue, &wave);
+                blinkStep = 0;    // Blinkcode sofort neu starten
+                blinkPhaseStart = xTaskGetTickCount();
+            }
+        }
+        lastRaw = raw;
+
+        // --- Blinkcode ---
+        int flashes = wave + 1;
+        int steps = 2 * flashes;              // an, aus, an, aus, ...
+        TickType_t now = xTaskGetTickCount();
+        TickType_t dur = (blinkStep >= steps) ? kBlinkPause
+                       : ((blinkStep % 2 == 0) ? kBlinkOn : kBlinkOff);
+        if (now - blinkPhaseStart >= dur) {
+            blinkPhaseStart = now;
+            blinkStep = (blinkStep >= steps) ? 0 : blinkStep + 1;
+        }
+        gpio_put(kStatusLedPin, (blinkStep < steps) && (blinkStep % 2 == 0));
+
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
@@ -767,6 +872,7 @@ void audioTask(void *) {
     }
     g_carrierNoiseMixQ16 = float_to_q16(kCarrierNoiseMix);
     setup_voiced_unvoiced();
+    g_wavePreEmphasisQ16 = float_to_q16(kWavePreEmphasis);
     g_noiseShapeCoeff = float_to_q16(1.0f - expf(-2.0f * (float)M_PI * kNoiseShapeFreqHz / (float)kSampleRateHz));
     for (int b = 0; b < kNumBands; ++b) {
         // Referenz-Boost x100 hier mit eingerechnet (VCA-Verstärkung).
@@ -865,6 +971,12 @@ void audioTask(void *) {
         if (kInvertPot) potNorm = 1.0f - potNorm;
         xQueueOverwrite(g_potRawQueue, &potNorm);
         xQueueReceive(g_carrierFreqQueue, &carrierHz, 0);
+        // Wellenwechsel nur an Puffergrenzen übernehmen; im ersten Puffer
+        // nach dem Wechsel wird von der alten zur neuen Form übergeblendet.
+        static uint8_t sWave = kWaveImpulse;
+        static uint8_t sPrevWave = kWaveImpulse;
+        sPrevWave = sWave;
+        xQueueReceive(g_waveQueue, &sWave, 0);
         uint32_t phaseInc = (uint32_t)((carrierHz * kCarrierTableSize / (float)kSampleRateHz) * 65536.0f);
 
         uint64_t waitStartUs = time_us_64();
@@ -890,6 +1002,22 @@ void audioTask(void *) {
         // Impulshöhe für gleiche Leistungsdichte wie das Rauschen (s.o.).
         q16 impulseHeightQ16 = float_to_q16(kVoicedLevel * (1.0f / sqrtf(3.0f)) *
                                             sqrtf((float)kSampleRateHz / carrierHz));
+        // Pegel von Sägezahn/Rechteck: Abgleich auf das Rauschen (s.o.),
+        // Tonhöhenabhängigkeit sqrt(f_ref / f0).
+        float pitchScale = sqrtf(kWaveRefHz / carrierHz);
+        q16 sawLevelQ16    = float_to_q16(kVoicedLevel * kSawLevelAtRef * pitchScale);
+        q16 squareLevelQ16 = float_to_q16(kVoicedLevel * kSquareLevelAtRef * pitchScale);
+        // Stimmhafter Carrier für eine bestimmte Wellenform (Rohwerte und
+        // Höhenanhebung werden unten pro Sample einmal berechnet).
+        auto voicedFor = [&](uint8_t w, q16 impulse, q16 sawEmph, q16 squareEmph, q16 noiseWhite) -> q16 {
+            switch (w) {
+                case kWaveSaw:    return q16_mul(sawEmph, sawLevelQ16);
+                case kWaveSquare: return q16_mul(squareEmph, squareLevelQ16);
+                case kWaveNoise:  return noiseWhite;
+                default:          return impulse;
+            }
+        };
+        const bool waveChanged = (sWave != sPrevWave);
         for (uint32_t i = 0; i < kBufferSamples; ++i) {
             q16 micQ16 = sMicBlock[i];
             if (micQ16 < sMicMinQ16) sMicMinQ16 = micQ16;
@@ -916,13 +1044,31 @@ void audioTask(void *) {
             // Impulszug: ein Impuls bei jedem Phasenüberlauf, sonst 0.
             uint32_t idxNow  = (phase >> 16) & (kCarrierTableSize - 1);
             uint32_t idxNext = ((phase + phaseInc) >> 16) & (kCarrierTableSize - 1);
-            q16 sawQ16 = (idxNext < idxNow) ? impulseHeightQ16 : 0; // (Name historisch: war Sägezahn)
+            q16 impulseQ16 = (idxNext < idxNow) ? impulseHeightQ16 : 0;
             q16 noiseQ16 = next_noise_q16();
+            q16 unvoicedQ16 = q16_mul(noiseQ16, g_unvoicedNoiseGainQ16);
+
+            // Sägezahn und Rechteck aus derselben Phase, jeweils mit
+            // Höhenanhebung y = x - a*x[n-1]. Beide laufen immer mit, damit
+            // ihr Filterzustand beim Umschalten stimmt.
+            q16 sawRaw = carrierTable[idxNow];
+            q16 squareRaw = (idxNow < (uint32_t)(kCarrierTableSize / 2)) ? kQ16One : -kQ16One;
+            q16 sawEmph = sawRaw - q16_mul(g_wavePreEmphasisQ16, g_sawPrev);
+            q16 squareEmph = squareRaw - q16_mul(g_wavePreEmphasisQ16, g_squarePrev);
+            g_sawPrev = sawRaw;
+            g_squarePrev = squareRaw;
+
+            q16 voicedQ16 = voicedFor(sWave, impulseQ16, sawEmph, squareEmph, unvoicedQ16);
+            if (waveChanged) {
+                // Lineare Überblendung über diesen einen Puffer (~11.6 ms).
+                q16 voicedOld = voicedFor(sPrevWave, impulseQ16, sawEmph, squareEmph, unvoicedQ16);
+                q16 t = (q16)(((int64_t)i << kQ16Frac) / kBufferSamples);
+                voicedQ16 = voicedOld + q16_mul(t, voicedQ16 - voicedOld);
+            }
             // Alter fester Rauschanteil (kCarrierNoiseMix, jetzt 0) bleibt
             // als Pfad erhalten, damit er sich zum Vergleich zuschalten lässt.
             g_noiseShapeState = g_noiseShapeState + q16_mul(g_noiseShapeCoeff, noiseQ16 - g_noiseShapeState);
-            q16 voicedQ16 = sawQ16 + q16_mul(g_carrierNoiseMixQ16, g_noiseShapeState - sawQ16);
-            q16 unvoicedQ16 = q16_mul(noiseQ16, g_unvoicedNoiseGainQ16);
+            voicedQ16 = voicedQ16 + q16_mul(g_carrierNoiseMixQ16, g_noiseShapeState - voicedQ16);
             int fadeIdx = (int)(((int64_t)g_vuvFade * kFadeTableSize) >> kQ16Frac);
             if (fadeIdx < 0) fadeIdx = 0;
             if (fadeIdx > kFadeTableSize) fadeIdx = kFadeTableSize;
@@ -1033,6 +1179,7 @@ void audioTask(void *) {
                    (unsigned long)sLastMicFill, (unsigned long)kMicTargetFill,
                    (unsigned long)g_micUnderruns, (unsigned long)g_micOverruns,
                    (unsigned long)(sMicWaitSumUs / sBufferCount));
+            printf("  carrier: %s\n", kWaveNames[sWave]);
             printf("  vuv: stimmlos=%lu%% prep=%luus\n",
                    (unsigned long)((uint64_t)sUnvoicedSamples * 100 / ((uint64_t)sBufferCount * kBufferSamples)),
                    (unsigned long)(sPrepSumUs / sBufferCount));
@@ -1118,7 +1265,8 @@ int main() {
 
     g_potRawQueue = xQueueCreate(1, sizeof(float));
     g_carrierFreqQueue = xQueueCreate(1, sizeof(float));
-    if (!g_potRawQueue || !g_carrierFreqQueue) {
+    g_waveQueue = xQueueCreate(1, sizeof(uint8_t));
+    if (!g_potRawQueue || !g_carrierFreqQueue || !g_waveQueue) {
         panic("Queue-Erstellung fehlgeschlagen (Heap zu klein?)");
     }
 
@@ -1129,7 +1277,7 @@ int main() {
     xTaskCreate(controlTask, "control", 512, nullptr, /*priority=*/1, nullptr);
 
     vTaskStartScheduler();
-git 
+
     panic("vTaskStartScheduler() zurueckgekehrt - Heap zu klein?");
     return 0;
 }
