@@ -38,7 +38,29 @@ pico_sdk_init()
 
 add_executable(vocoder
     src/main.cpp
+    src/mic_input.cpp
+    src/audio_output.cpp
+    src/controls.cpp
+    src/carrier.cpp
+    src/voiced_unvoiced.cpp
+    src/dynamics.cpp
+    src/filterbank.cpp
+    src/dual_core.cpp
+    src/audio_task.cpp
+    src/diagnostics.cpp
 )
+
+# Build-Zeitstempel für die Diagnoseausgabe: build_stamp.h wird bei JEDEM
+# Build neu erzeugt (ALL + kein OUTPUT -> immer veraltet), damit der
+# angezeigte Stempel immer zum laufenden Stand passt - auch wenn nur
+# einzelne .cpp-Dateien neu kompiliert werden.
+add_custom_target(build_stamp ALL
+    COMMAND ${CMAKE_COMMAND} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/generated/build_stamp.h
+            -P ${CMAKE_CURRENT_LIST_DIR}/cmake/build_stamp.cmake
+    BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/generated/build_stamp.h
+    COMMENT "Build-Zeitstempel aktualisieren"
+)
+add_dependencies(vocoder build_stamp)
 
 # INMP441-I2S-Mikrofon: PIO-Programm des I2S-Empfängers übersetzen.
 # Erzeugt i2s_mic.pio.h im Build-Verzeichnis (Include-Pfad setzt das
@@ -49,6 +71,7 @@ pico_generate_pio_header(vocoder ${CMAKE_CURRENT_LIST_DIR}/src/i2s_mic.pio)
 # bekanntmachen, damit FreeRTOS.h ihn findet.
 target_include_directories(vocoder PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}/generated   # build_stamp.h
 )
 
 # Generischer Pico + externes PCM5100A/PCM5102A-Breakout: I2S-Pins sind
