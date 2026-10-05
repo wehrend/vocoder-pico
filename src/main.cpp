@@ -815,17 +815,13 @@ void controlTask(void *) {
 
         // --- Taster ---
         bool raw = !gpio_get(kWaveButtonPin);
-        // DEBUG: jeden Pegelwechsel an GP14 ausgeben
-        if (raw != lastRaw) {
-            printf("[Taster] GP14 %s (Pin-Pegel=%d)\n",
-                   raw ? "GEDRUECKT" : "losgelassen", (int)gpio_get(kWaveButtonPin));
-        }
         xQueueOverwrite(g_waveQueue, &wave);
         if (raw == lastRaw && raw != stablePressed) {
             stablePressed = raw;
             if (stablePressed) {  // Flanke "gedrückt" -> nächste Wellenform
                 wave = (uint8_t)((wave + 1) % kWaveCount);
                 xQueueOverwrite(g_waveQueue, &wave);
+                printf("Wellenform: %d/%d %s\n", wave + 1, (int)kWaveCount, kWaveNames[wave]);  // genau 1x pro Tastendruck
                 blinkStep = 0;    // Blinkcode sofort neu starten
                 blinkPhaseStart = xTaskGetTickCount();
             }
@@ -1162,10 +1158,10 @@ void audioTask(void *) {
         sLastMicDcPermille = (int)(((int64_t)g_micDcState * 1000) / kQ16One);
         sLastMicFill = mic_available();
 
-        if (++sBufferCount >= 100) {
+        if (++sBufferCount >= 1000) {
             int micMinPermille = (int)(((int64_t)sMicMinQ16 * 1000) / kQ16One);
             int micMaxPermille = (int)(((int64_t)sMicMaxQ16 * 1000) / kQ16One);
-            printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 compEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
+           printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 compEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
                    __DATE__, __TIME__,
                    (unsigned long)(sSumUs / sBufferCount), (unsigned long)sMaxUs,
                    (unsigned long)(sWaitSumUs / sBufferCount), (unsigned long)sWaitMaxUs,
@@ -1179,7 +1175,6 @@ void audioTask(void *) {
                    (unsigned long)sLastMicFill, (unsigned long)kMicTargetFill,
                    (unsigned long)g_micUnderruns, (unsigned long)g_micOverruns,
                    (unsigned long)(sMicWaitSumUs / sBufferCount));
-            printf("  carrier: %s\n", kWaveNames[sWave]);
             printf("  vuv: stimmlos=%lu%% prep=%luus\n",
                    (unsigned long)((uint64_t)sUnvoicedSamples * 100 / ((uint64_t)sBufferCount * kBufferSamples)),
                    (unsigned long)(sPrepSumUs / sBufferCount));
