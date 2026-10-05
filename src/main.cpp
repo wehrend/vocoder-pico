@@ -90,11 +90,13 @@
 #include "pico/stdlib.h"
 #include "pico/audio_i2s.h"
 #include "pico/time.h"
-#include "hardware/adc.h"
 #include "hardware/sync.h"
 #include "pico/multicore.h"
 #include "config.h"
 #include "mic_input.h"
+#include "audio_output.h"
+#include "controls.h"
+#include "carrier_wave.h"
 #include "fixed_point.h"
 #include "biquad_fixed.h"
 #include "vocoder_band_fixed.h"
@@ -200,58 +202,6 @@ void build_carrier_table() {
     }
 }
 
-audio_buffer_pool_t *setup_audio() {
-    static audio_format_t audioFormat = {
-        .sample_freq = kSampleRateHz,
-        .format = AUDIO_BUFFER_FORMAT_PCM_S16,
-        .channel_count = 2,
-    };
-    static audio_buffer_format_t producerFormat = {
-        .format = &audioFormat,
-        .sample_stride = 4,
-    };
-
-    audio_buffer_pool_t *pool = audio_new_producer_pool(&producerFormat, 4, kBufferSamples);
-
-    audio_i2s_config_t i2sConfig = {
-        .data_pin = PICO_AUDIO_I2S_DATA_PIN,
-        .clock_pin_base = PICO_AUDIO_I2S_CLOCK_PIN_BASE,
-        .dma_channel = 0,
-        .pio_sm = 0,
-    };
-
-    const audio_format_t *outputFormat = audio_i2s_setup(&audioFormat, &i2sConfig);
-    if (!outputFormat) {
-        panic("I2S-Setup fehlgeschlagen - Pins/Format pruefen");
-    }
-
-    audio_i2s_connect(pool);
-    audio_i2s_set_enabled(true);
-    return pool;
-}
-
-void setup_adc() {
-    adc_init();
-    adc_gpio_init(POT_ADC_GPIO);
-    // Einziger ADC-Kanal ist jetzt der Pot - einmal auswählen reicht.
-    adc_select_input(POT_ADC_CHANNEL);
-}
-
-float read_adc_normalized() {
-    uint16_t raw = adc_read();
-    return (float)raw / 4095.0f;
-}
-
-// Umkehr-Schalter für den Fall, dass das Poti physisch andersherum
-// verkabelt ist als die Software erwartet (siehe DEVLOG - `pot=`
-// blieb bei zwei Tests trotz Drehens am selben Anschlag auf ~1000
-// hängen, noch nicht abschließend bestätigt, ob das an der
-// Verkabelung lag oder schlicht zweimal derselbe Anschlag getroffen
-// wurde). Auf true stellen, falls sich am tiefen Poti-Anschlag
-// weiterhin `pot=` nahe 1000 statt nahe 0 zeigt - kein Kabel-Umbau
-// nötig, einfach hier umschalten.
-constexpr bool kInvertPot = false;
-
 // =====================================================================
 // CARRIER-WELLENFORMEN mit Pegel- und Spektralabgleich
 // =====================================================================
@@ -271,19 +221,6 @@ constexpr bool kInvertPot = false;
 // unterscheidet. Oberhalb ~400 Hz klingen Sägezahn und Impulszug nach
 // dem Vocoder sehr ähnlich (beide: alle Obertöne, flach); das Rechteck
 // unterscheidet sich hörbar (nur ungerade Obertöne -> "hohl").
-enum CarrierWave : uint8_t {
-    kWaveImpulse = 0,
-    kWaveSaw     = 1,
-    kWaveSquare  = 2,
-    kWaveNoise   = 3,   // nur Rauschen -> Flüsterstimme
-    kWaveCount   = 4
-};
-const char *const kWaveNames[kWaveCount] = {"Impulszug", "Saegezahn", "Rechteck", "Rauschen"};
-
-// KALIBRIER-SCHALTER: -1 = Wellenform per Taster wählbar (Normalbetrieb).
-// 0..3 = fest eingestellt, Taster wird ignoriert:
-//   0 = Impulszug, 1 = Sägezahn, 2 = Rechteck, 3 = Rauschen
-constexpr int kFixedWave = -1;
 constexpr float kWavePreEmphasis   = 0.9f;
 constexpr float kWaveRefHz         = 110.0f;
 constexpr float kSawLevelAtRef     = 4.00f;  // Simulation: Abgleich auf Rauschen, Bänder 4..7
@@ -292,12 +229,7 @@ constexpr float kSquareLevelAtRef  = 2.18f;  // war 2.81 - Messung: im Formantbe
 q16 g_wavePreEmphasisQ16 = 0;
 q16 g_sawPrev = 0;      // letzter Rohwert für die Höhenanhebung
 q16 g_squarePrev = 0;
-QueueHandle_t g_waveQueue = nullptr;
 
-// Queues zur Kommunikation zwischen audioTask (ADC-Besitzer) und
-// controlTask (Glättung/Mapping) - unverändert aus dem Vocoder-Projekt.
-QueueHandle_t g_potRawQueue = nullptr;
-QueueHandle_t g_carrierFreqQueue = nullptr;
 
 // --- Kompressor-Parameter (siehe DEVLOG Nachtrag 12 für die
 // Herleitung) - Werte sind hier NEU zu kalibrieren: erst für die
@@ -536,68 +468,6 @@ void core1_entry() {
     }
 }
 
-void controlTask(void *) {
-    float smoothedHz = 220.0f;
-
-    // Taster (GP14, Pullup -> gedrückt = 0) und Status-LED (GP25).
-    gpio_init(kWaveButtonPin);
-    gpio_set_dir(kWaveButtonPin, GPIO_IN);
-    gpio_pull_up(kWaveButtonPin);
-    gpio_init(kStatusLedPin);
-    gpio_set_dir(kStatusLedPin, GPIO_OUT);
-
-    uint8_t wave = (kFixedWave >= 0) ? (uint8_t)kFixedWave : (uint8_t)kWaveImpulse;
-    xQueueOverwrite(g_waveQueue, &wave);
-
-    // Entprellung: Zustand muss zwei Abfragen (~40 ms) stabil sein.
-    bool stablePressed = false;
-    bool lastRaw = false;
-    // Blinkcode: (wave+1) kurze Blitze, dann Pause - zeitgesteuert über
-    // den FreeRTOS-Tick, unabhängig von der Schleifendauer.
-    constexpr TickType_t kBlinkOn    = pdMS_TO_TICKS(120);
-    constexpr TickType_t kBlinkOff   = pdMS_TO_TICKS(180);
-    constexpr TickType_t kBlinkPause = pdMS_TO_TICKS(900);
-    TickType_t blinkPhaseStart = xTaskGetTickCount();
-    int blinkStep = 0;   // 0..2*(wave+1)-1: an/aus im Wechsel, danach Pause
-
-    for (;;) {
-        float potNorm;
-        if (xQueueReceive(g_potRawQueue, &potNorm, pdMS_TO_TICKS(50)) == pdTRUE) {
-            float targetHz = kMinCarrierHz + potNorm * (kMaxCarrierHz - kMinCarrierHz);
-            smoothedHz += (targetHz - smoothedHz) * 0.2f;
-            xQueueOverwrite(g_carrierFreqQueue, &smoothedHz);
-        }
-
-        // --- Taster ---
-        bool raw = !gpio_get(kWaveButtonPin);
-        if (kFixedWave < 0 && raw == lastRaw && raw != stablePressed) {
-            stablePressed = raw;
-            if (stablePressed) {  // Flanke "gedrückt" -> nächste Wellenform
-                wave = (uint8_t)((wave + 1) % kWaveCount);
-                xQueueOverwrite(g_waveQueue, &wave);
-                printf("Wellenform: %d/%d %s\n", wave + 1, (int)kWaveCount, kWaveNames[wave]);
-                blinkStep = 0;    // Blinkcode sofort neu starten
-                blinkPhaseStart = xTaskGetTickCount();
-            }
-        }
-        lastRaw = raw;
-
-        // --- Blinkcode ---
-        int flashes = wave + 1;
-        int steps = 2 * flashes;              // an, aus, an, aus, ...
-        TickType_t now = xTaskGetTickCount();
-        TickType_t dur = (blinkStep >= steps) ? kBlinkPause
-                       : ((blinkStep % 2 == 0) ? kBlinkOn : kBlinkOff);
-        if (now - blinkPhaseStart >= dur) {
-            blinkPhaseStart = now;
-            blinkStep = (blinkStep >= steps) ? 0 : blinkStep + 1;
-        }
-        gpio_put(kStatusLedPin, (blinkStep < steps) && (blinkStep % 2 == 0));
-
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-}
-
 void audioTask(void *) {
     build_carrier_table();
     // Geometrische Verteilung exakt wie in vocoderBands.ts
@@ -716,8 +586,7 @@ void audioTask(void *) {
     static uint32_t sLastMicFill = 0;
 
     for (;;) {
-        float potNorm = read_adc_normalized();
-        if (kInvertPot) potNorm = 1.0f - potNorm;
+        float potNorm = read_pot();
         xQueueOverwrite(g_potRawQueue, &potNorm);
         xQueueReceive(g_carrierFreqQueue, &carrierHz, 0);
         // Wellenwechsel nur an Puffergrenzen übernehmen; im ersten Puffer
@@ -1012,16 +881,11 @@ extern "C" void vApplicationMallocFailedHook(void) {
 int main() {
     stdio_init_all();
 
-    g_potRawQueue = xQueueCreate(1, sizeof(float));
-    g_carrierFreqQueue = xQueueCreate(1, sizeof(float));
-    g_waveQueue = xQueueCreate(1, sizeof(uint8_t));
-    if (!g_potRawQueue || !g_carrierFreqQueue || !g_waveQueue) {
-        panic("Queue-Erstellung fehlgeschlagen (Heap zu klein?)");
-    }
+    controls_create_queues();
 
-    // Rechenlast mit 3 Bändern weiterhin gering genug (statt 12-Band-
-    // Filterbank) - ein einzelner Task auf Core0 reicht bequem, kein
-    // Core1 mehr nötig.
+    // audioTask (Core0, hohe Priorität) verteilt die Bandberechnung pro
+    // Puffer auf beide Kerne: Core1 läuft außerhalb von FreeRTOS in
+    // core1_entry() und wird aus audioTask heraus gestartet.
     xTaskCreate(audioTask, "audio", 1024, nullptr, /*priority=*/3, nullptr);
     xTaskCreate(controlTask, "control", 512, nullptr, /*priority=*/1, nullptr);
 
