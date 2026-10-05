@@ -97,6 +97,7 @@
 #include "hardware/sync.h"
 #include "pico/multicore.h"
 #include "i2s_mic.pio.h"
+#include "config.h"
 #include "fixed_point.h"
 #include "biquad_fixed.h"
 #include "vocoder_band_fixed.h"
@@ -105,99 +106,6 @@
 #include <cstdio>
 
 namespace {
-
-// --- Pin-Zuordnung ---
-// Pot weiterhin am internen ADC. GP27 (früher Mic-ADC) ist jetzt frei.
-constexpr uint POT_ADC_GPIO       = 26;
-constexpr uint8_t POT_ADC_CHANNEL = 0;
-
-// INMP441 (I2S-Mic), siehe hello_mic_test/README.md für die Verkabelung.
-// SCK und WS MÜSSEN aufeinanderfolgende GPIOs sein (WS = SCK + 1),
-// weil beide per side_set gesetzt werden. L/R des INMP441 auf GND.
-// Bewusst getrennt von den DAC-Pins (GP16-18).
-constexpr uint kMicSckPin = 10;
-constexpr uint kMicWsPin  = 11;
-constexpr uint kMicSdPin  = 12;
-
-// Bedienung (siehe DEVLOG, Branch feature/carrier-waveforms):
-// Taster schaltet die Carrier-Wellenform weiter, die Onboard-LED zeigt
-// die gewählte Wellenform als Blinkcode (1x = Impulszug, 2x = Sägezahn,
-// 3x = Rechteck, 4x = Rauschen), danach Pause.
-// Taster: GP14 (Pin 19) gegen GND (Pin 18 direkt daneben), interner
-// Pullup -> gedrückt = 0. 6x6-Taster am besten DIAGONAL anschließen
-// (dann ist die Einbaurichtung egal, siehe DEVLOG).
-// LED: GP25 ist die Onboard-LED des Pico (NICHT beim Pico W - dort hängt
-// die LED am WLAN-Chip).
-constexpr uint kWaveButtonPin = 14;
-constexpr uint kStatusLedPin  = 25;
-
-// Carrier-Tonhöhenbereich - unverändert.
-// ZURÜCKGESETZT auf 80Hz (siehe DEVLOG Nachtrag 31): die Einengung auf
-// 150/200Hz war eine Reaktion auf Kontamination, die zumindest teilweise
-// durch die (jetzt ebenfalls zurückgesetzte) 400Hz-Envelope-Analyse
-// mitverursacht wurde, nicht nur durch die Carrier-Frequenz selbst.
-// 80Hz war der zuletzt bestätigt funktionierende Wert, direkt nach der
-// DIN-Leitungs-Umverlegung.
-// Auf die bestätigt sichere Mitte eingegrenzt (war 80-400Hz, dann
-// 180-380Hz) - siehe DEVLOG Nachtrag 38/39: 380Hz war immer noch zu
-// nah am oberen Problembereich (355-379Hz zeigte anhaltendes
-// Hängenbleiben, teils über mehrere Sekunden und mehrere Poti-
-// Stellungen hinweg). 184Hz und 262-266Hz bestätigt sauber. Die
-// eigentliche elektrische Ursache ist weiterhin nicht gefunden, das
-// hier bleibt ein pragmatisches Eingrenzen, keine Lösung.
-// Voller Bereich wiederhergestellt (siehe DEVLOG Nachtrag 47): die
-// Sternerdung hat die eigentliche elektrische Ursache (Masseschleife
-// über den gemeinsamen Steckbrett-GND-Pfad, siehe Nachtrag 42/43)
-// tatsächlich behoben, bestätigt über den kompletten 80-400Hz-Bereich.
-// Die vorherige Eingrenzung auf 180-300Hz (Nachtrag 38/39) war nur ein
-// Software-seitiges Umgehen des Symptoms, keine Lösung - jetzt nicht
-// mehr nötig.
-constexpr float kMinCarrierHz = 110.0f; // VORÜBERGEHEND fest für A/B-Tests (war 80)
-constexpr float kMaxCarrierHz = 110.0f; // VORÜBERGEHEND fest für A/B-Tests (war 400)
-
-// Rechenlast ist jetzt trivial (1 Bandpass statt 12) - volle 44.1kHz
-// sind wieder problemlos drin, kein Grund mehr für die 22.05kHz-
-// Absenkung aus der Vocoder-Serie.
-// Von 44.1kHz auf 22.05kHz gesenkt (siehe DEVLOG Nachtrag 50) - 6
-// Bänder (je Analyse+Synthese) überschreiten bei voller Samplerate das
-// CPU-Budget (avg=6400-6700us gegen budget=5804us) - exakt dasselbe
-// Muster, das beim ursprünglichen 12-Band-Projekt zur selben Maßnahme
-// führte. Höchstes Band liegt bei 2000Hz, Nyquist bei 22.05kHz bleibt
-// bei 11kHz - kein Informationsverlust.
-constexpr uint32_t kSampleRateHz  = 22050;
-constexpr uint32_t kBufferSamples = 256;
-
-// --- 3-Band-Filterbank (siehe Nachtrag 44) ---
-// Frequenzbereich bewusst innerhalb dessen gewählt, wo laut Vocoder-
-// Diagnose (Nachtrag 23) noch brauchbar viel Mic-Signalenergie ankommt
-// (Gain-Bandbreite-Kompromiss am MAX4466 lässt oberhalb von grob
-// 1-1.5kHz kaum noch etwas durch). Geometrisch gestaffelt: 150Hz /
-// ~424Hz / 1200Hz. Erster Schätzwert, kein gemessenes Optimum.
-// === 10-BAND-NACHBAU DER SOFTWARE-REFERENZ (modular-synth) ===
-// Quellen: src/nodes/VocoderBands.ts, VocoderAnalysisNode.tsx,
-// VocoderSynthNode.tsx. Ziel ist ein TREUER Nachbau der bewiesen
-// funktionierenden Referenz statt weiterer eigener Theorien (siehe
-// DEVLOG: Baseline 1ccc1be, Tag baseline-gut). Einzige bewusste
-// Abweichungen: Carrier (unverändert aus der Baseline) und das Gate
-// (die Referenz hat keins, siehe unten).
-//
-// VocoderBands.ts: 10 Bänder, 90-6000 Hz geometrisch, Q=5 - und
-// ausdrücklich GLEICHES Q für Analyse und Synthese.
-constexpr int kNumBands = 10;
-constexpr float kBandFreqLowHz  = 90.0f;
-constexpr float kBandFreqHighHz = 6000.0f;
-constexpr float kBandQ          = 5.0f;
-constexpr float kSynthesisQ     = 2.0f; // TEST: Referenz 5.0 - bei Q=5 fällt pro Synthese-
-// band meist nur EIN Oberton des Carriers (Orgelklang, kaum Vokalfarbe).
-// Q~2 ist für 10 Bänder (~0.68 Oktaven Abstand) etwa lückenlos.
-// Messen über die Diagnosezeile outAvg (Vokaltest aaa/iii/uuu).
-
-// Hüllkurve: Referenz nutzt Tone.Follower(0.02) = Gleichrichter +
-// einpoliger Tiefpass mit Grenzfrequenz 1/0.02s = 50 Hz, also eine
-// Zeitkonstante von 0.02/(2*pi) = 3.18 ms - SYMMETRISCH (gleich schnell
-// steigend wie fallend). Vorher: Attack 3-8 ms, Release 60-120 ms.
-constexpr float kFollowerSmoothingS = 0.02f;
-constexpr float kFollowerTauMs = 1000.0f * kFollowerSmoothingS / (2.0f * (float)M_PI);
 
 VocoderBandFixed bands[kNumBands];
 
@@ -536,7 +444,7 @@ constexpr int kFixedWave = -1;
 constexpr float kWavePreEmphasis   = 0.9f;
 constexpr float kWaveRefHz         = 110.0f;
 constexpr float kSawLevelAtRef     = 4.00f;  // Simulation: Abgleich auf Rauschen, Bänder 4..7
-constexpr float kSquareLevelAtRef  = 2.18f;
+constexpr float kSquareLevelAtRef  = 2.18f;  // war 2.81 - Messung: im Formantbereich ~1.29x zu laut, danach ±1 dB
 
 q16 g_wavePreEmphasisQ16 = 0;
 q16 g_sawPrev = 0;      // letzter Rohwert für die Höhenanhebung
@@ -819,13 +727,12 @@ void controlTask(void *) {
 
         // --- Taster ---
         bool raw = !gpio_get(kWaveButtonPin);
-        xQueueOverwrite(g_waveQueue, &wave);
-        if (raw == lastRaw && raw != stablePressed) {
+        if (kFixedWave < 0 && raw == lastRaw && raw != stablePressed) {
             stablePressed = raw;
             if (stablePressed) {  // Flanke "gedrückt" -> nächste Wellenform
                 wave = (uint8_t)((wave + 1) % kWaveCount);
                 xQueueOverwrite(g_waveQueue, &wave);
-                printf("Wellenform: %d/%d %s\n", wave + 1, (int)kWaveCount, kWaveNames[wave]);  // genau 1x pro Tastendruck
+                printf("Wellenform: %d/%d %s\n", wave + 1, (int)kWaveCount, kWaveNames[wave]);
                 blinkStep = 0;    // Blinkcode sofort neu starten
                 blinkPhaseStart = xTaskGetTickCount();
             }
@@ -1162,10 +1069,10 @@ void audioTask(void *) {
         sLastMicDcPermille = (int)(((int64_t)g_micDcState * 1000) / kQ16One);
         sLastMicFill = mic_available();
 
-        if (++sBufferCount >= 300) {
+        if (++sBufferCount >= 100) {
             int micMinPermille = (int)(((int64_t)sMicMinQ16 * 1000) / kQ16One);
             int micMaxPermille = (int)(((int64_t)sMicMaxQ16 * 1000) / kQ16One);
-           printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 compEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
+            printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 compEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
                    __DATE__, __TIME__,
                    (unsigned long)(sSumUs / sBufferCount), (unsigned long)sMaxUs,
                    (unsigned long)(sWaitSumUs / sBufferCount), (unsigned long)sWaitMaxUs,
@@ -1179,6 +1086,7 @@ void audioTask(void *) {
                    (unsigned long)sLastMicFill, (unsigned long)kMicTargetFill,
                    (unsigned long)g_micUnderruns, (unsigned long)g_micOverruns,
                    (unsigned long)(sMicWaitSumUs / sBufferCount));
+            printf("  carrier: %s\n", kWaveNames[sWave]);
             printf("  vuv: stimmlos=%lu%% prep=%luus\n",
                    (unsigned long)((uint64_t)sUnvoicedSamples * 100 / ((uint64_t)sBufferCount * kBufferSamples)),
                    (unsigned long)(sPrepSumUs / sBufferCount));
