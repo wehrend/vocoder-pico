@@ -29,38 +29,38 @@ include(pico_sdk_import.cmake)
 include(pico_extras_import.cmake)
 include(FreeRTOS_Kernel_import.cmake)
 
-project(envelope_talkbox C CXX ASM)
+project(vocoder C CXX ASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
-add_executable(envelope_talkbox
+add_executable(vocoder
     src/main.cpp
 )
 
 # INMP441-I2S-Mikrofon: PIO-Programm des I2S-Empfängers übersetzen.
 # Erzeugt i2s_mic.pio.h im Build-Verzeichnis (Include-Pfad setzt das
 # SDK automatisch), siehe DEVLOG (Umstieg MAX4466/ADC -> INMP441).
-pico_generate_pio_header(envelope_talkbox ${CMAKE_CURRENT_LIST_DIR}/src/i2s_mic.pio)
+pico_generate_pio_header(vocoder ${CMAKE_CURRENT_LIST_DIR}/src/i2s_mic.pio)
 
 # FreeRTOSConfig.h liegt im Projekt-Root (nicht unter src/) - Pfad hier
 # bekanntmachen, damit FreeRTOS.h ihn findet.
-target_include_directories(envelope_talkbox PRIVATE
+target_include_directories(vocoder PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
 )
 
 # Generischer Pico + externes PCM5100A/PCM5102A-Breakout: I2S-Pins sind
 # frei wählbar - an deine tatsächliche Verkabelung anpassen.
-target_compile_definitions(envelope_talkbox PRIVATE
+target_compile_definitions(vocoder PRIVATE
     PICO_AUDIO_I2S_DATA_PIN=18
     PICO_AUDIO_I2S_CLOCK_PIN_BASE=16
 )
 
 # pico_multicore wieder nötig: der 10-Band-Vocoder rechnet die obere
 # Hälfte der Bänder auf Core1 (siehe DEVLOG / main.cpp, core1_entry).
-target_link_libraries(envelope_talkbox PRIVATE
+target_link_libraries(vocoder PRIVATE
     pico_stdlib
     pico_audio_i2s
     pico_multicore    # Core1 rechnet Bänder 5..9
@@ -71,7 +71,7 @@ target_link_libraries(envelope_talkbox PRIVATE
     FreeRTOS-Kernel-Heap4
 )
 
-pico_enable_stdio_usb(envelope_talkbox 1)
-pico_enable_stdio_uart(envelope_talkbox 0)
+pico_enable_stdio_usb(vocoder 1)
+pico_enable_stdio_uart(vocoder 0)
 
-pico_add_extra_outputs(envelope_talkbox)
+pico_add_extra_outputs(vocoder)
