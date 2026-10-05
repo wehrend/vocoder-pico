@@ -38,6 +38,7 @@ pico_sdk_init()
 
 add_executable(vocoder
     src/main.cpp
+    src/mic_input.cpp
 )
 
 # INMP441-I2S-Mikrofon: PIO-Programm des I2S-Empfängers übersetzen.
