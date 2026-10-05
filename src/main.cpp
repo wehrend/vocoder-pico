@@ -529,10 +529,14 @@ enum CarrierWave : uint8_t {
 };
 const char *const kWaveNames[kWaveCount] = {"Impulszug", "Saegezahn", "Rechteck", "Rauschen"};
 
+// KALIBRIER-SCHALTER: -1 = Wellenform per Taster wählbar (Normalbetrieb).
+// 0..3 = fest eingestellt, Taster wird ignoriert:
+//   0 = Impulszug, 1 = Sägezahn, 2 = Rechteck, 3 = Rauschen
+constexpr int kFixedWave = -1;
 constexpr float kWavePreEmphasis   = 0.9f;
 constexpr float kWaveRefHz         = 110.0f;
 constexpr float kSawLevelAtRef     = 4.00f;  // Simulation: Abgleich auf Rauschen, Bänder 4..7
-constexpr float kSquareLevelAtRef  = 2.81f;
+constexpr float kSquareLevelAtRef  = 2.18f;
 
 q16 g_wavePreEmphasisQ16 = 0;
 q16 g_sawPrev = 0;      // letzter Rohwert für die Höhenanhebung
@@ -791,7 +795,7 @@ void controlTask(void *) {
     gpio_init(kStatusLedPin);
     gpio_set_dir(kStatusLedPin, GPIO_OUT);
 
-    uint8_t wave = kWaveImpulse;
+    uint8_t wave = (kFixedWave >= 0) ? (uint8_t)kFixedWave : (uint8_t)kWaveImpulse;
     xQueueOverwrite(g_waveQueue, &wave);
 
     // Entprellung: Zustand muss zwei Abfragen (~40 ms) stabil sein.
@@ -1158,7 +1162,7 @@ void audioTask(void *) {
         sLastMicDcPermille = (int)(((int64_t)g_micDcState * 1000) / kQ16One);
         sLastMicFill = mic_available();
 
-        if (++sBufferCount >= 1000) {
+        if (++sBufferCount >= 300) {
             int micMinPermille = (int)(((int64_t)sMicMinQ16 * 1000) / kQ16One);
             int micMaxPermille = (int)(((int64_t)sMicMaxQ16 * 1000) / kQ16One);
            printf("Diagnose[%s %s]: avg=%luus max=%luus wait=%luus waitMax=%luus budget=%luus pot=%d/1000 carrierHz=%d micMin=%d/1000 micMax=%d/1000 micDc=%d/1000 compEnv=%d/1000 gateGain=%d/1000 (100 Puffer)\n",
