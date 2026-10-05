@@ -97,6 +97,9 @@
 #include "audio_output.h"
 #include "controls.h"
 #include "carrier_wave.h"
+#include "carrier.h"
+#include "voiced_unvoiced.h"
+#include "dynamics.h"
 #include "fixed_point.h"
 #include "biquad_fixed.h"
 #include "vocoder_band_fixed.h"
@@ -134,6 +137,9 @@ VocoderBandFixed bands[kNumBands];
 // Sägezahn und hob weißes Rauschen bei "sss" um ~+28 dB zu stark an.)
 constexpr float kBandOutputGain[kNumBands] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
 constexpr float kBandTiltRefHz = 365.0f; // Band 3 behält Gewicht 1.0
+// Hüllkurven-Verstärkung der Referenz (ANALYSIS_GAIN_BOOST, x100), in
+// die Bandgewichtung eingerechnet (VCA-Verstärkung pro Band).
+constexpr int kAnalysisGainBoost = 100;
 q16 g_bandOutputGainQ16[kNumBands];
 
 // DIAGNOSE-SCHALTER: -1 = normaler Mix aller Bänder. 0..kNumBands-1 =
@@ -143,258 +149,12 @@ q16 g_bandOutputGainQ16[kNumBands];
 // Vokal. Siehe DEVLOG Nachtrag 53.
 constexpr int kSoloBand = -1;
 
-// Pulszug-Wavetable für den Carrier (siehe DEVLOG Nachtrag 13 für die
-// Begründung: gleichmäßigeres Obertonspektrum als ein Sägezahn). Hier
-// nur noch fürs Timbre des Tons selbst relevant, nicht mehr für
-// Formant-Abdeckung wie beim Vocoder.
-constexpr int kCarrierTableSize = 512;
-q16 carrierTable[kCarrierTableSize];
-
-// Einfacher Pseudozufalls-Rauschgenerator (linearer Kongruenzgenerator)
-// für die Rauschbeimischung in den Carrier - siehe DEVLOG Nachtrag 55.
-uint32_t g_noiseState = 12345;
-inline q16 next_noise_q16() {
-    g_noiseState = g_noiseState * 1664525u + 1013904223u;
-    int32_t raw = (int32_t)(g_noiseState >> 8); // obere 24 Bit, gleichmäßiger verteilt
-    return (raw & (kQ16One - 1)) - (kQ16One >> 1); // grob auf [-0.5, 0.5) skaliert
-}
-
-// Fester Rauschanteil im Carrier - siehe DEVLOG Nachtrag 55: ein rein
-// periodischer Carrier hat nur diskrete, lückenhafte Obertöne, die je
-// nach Tonhöhe zufällig ein Synthese-Fenster treffen oder verfehlen,
-// UNABHÄNGIG vom Sprachinhalt. Rauschen liefert kontinuierliche,
-// lückenlose Energie über das ganze Spektrum - jedes Band bekommt
-// garantiert echte, unterscheidbare Substanz zum Formen. Noch KEINE
-// Stimmhaft/Unstimmhaft-Umschaltung (das wäre der nächste, feinere
-// Schritt) - erstmal ein fester Mix, um die Grundidee zu testen.
-constexpr float kCarrierNoiseMix = 0.0f; // war 0.4 - ersetzt durch die Stimmhaft/Stimmlos-Umschaltung (Referenz: VoicedUnvoicedNode), Pfad bleibt zum Vergleich erhalten
-q16 g_carrierNoiseMixQ16 = 0;
-
-// "Rosa" statt weißes Rauschen - siehe DEVLOG Nachtrag 56: weißes
-// Rauschen hat gleiche Energie pro Hertz, aber unsere Bänder haben
-// alle dasselbe Q -> höhere Bänder haben eine breitere absolute
-// Bandbreite und fangen dadurch systematisch mehr vom weißen Rauschen
-// ein, unabhängig von der Stimme (Band 5 wurde dadurch viel lauter
-// als Band 0). Ein einfacher Tiefpass vor der Beimischung gibt dem
-// Rauschen mehr Energie pro Oktave statt pro Hertz - passt zur
-// konstanten-Q-Bandaufteilung. Grenzfrequenz grob in der Mitte des
-// Bandbereichs, erster Schätzwert.
-constexpr float kNoiseShapeFreqHz = 400.0f;
-q16 g_noiseShapeCoeff = 0;
-q16 g_noiseShapeState = 0;
-
-void build_carrier_table() {
-    // 50% statt der ursprünglichen 20% (die waren fürs breitbandige
-    // Obertonspektrum des 12-Band-Vocoders gedacht, siehe Nachtrag 13 -
-    // für die Talkbox nicht mehr nötig). Ein Rechtecksignal hat von
-    // Natur aus weniger hochfrequente Energie als ein schmaler
-    // Pulszug - löst das "unangenehm schrill bei hohen Tonhöhen"-
-    // Problem an der Quelle, statt nachträglich zu filtern (siehe
-    // DEVLOG Nachtrag 36 - der Ausgangs-Tiefpass hatte einen
-    // unerklärten Nebeneffekt auf die Gate-Rückkopplung).
-    // Sägezahn statt 50%-Rechteck (Referenz-Nachbau): alle Obertöne mit
-    // 1/n statt nur ungerade - beim Rechteck blieben bei Q=5 gerade die
-    // Formantbänder (580/930/1480 Hz) ohne Oberton, siehe DEVLOG.
-    for (int i = 0; i < kCarrierTableSize; ++i) {
-        float phase = (float)i / (float)kCarrierTableSize;
-        float saw = 2.0f * phase - 1.0f;
-        carrierTable[i] = float_to_q16(saw);
-    }
-}
-
-// =====================================================================
-// CARRIER-WELLENFORMEN mit Pegel- und Spektralabgleich
-// =====================================================================
-// Alle stimmhaften Carrier werden so angepasst, dass sie im Formant-
-// bereich (Bänder 4..7, ~580-2400 Hz) dieselbe Leistung pro Band
-// liefern wie das weiße Rauschen für die Zischlaute. Nur dann passt
-// EINE Bandgewichtung (sqrt(365/f)) für alle Wellenformen, und Vokale
-// und Zischlaute bleiben im Gleichgewicht (siehe DEVLOG: der rohe
-// Sägezahn fiel um ~6 dB/Oktave ab, die hohen Formanten lagen 20-60 dB
-// unter dem Grundton -> keine Vokalunterschiede hörbar).
-//
-// Sägezahn und Rechteck: Höhenanhebung y[n] = x[n] - a*x[n-1] mit
-// a = kWavePreEmphasis, danach Skalierung * sqrt(110 Hz / f0).
-// Simulation (gleiche Filter/Tabellen wie hier, Q=2, f0 = 110/200 Hz):
-// ab ~365 Hz innerhalb ±1 dB am Rauschen; die untersten Bänder behalten
-// etwas mehr Bass - das ist der Charakter, der die Wellenformen dort
-// unterscheidet. Oberhalb ~400 Hz klingen Sägezahn und Impulszug nach
-// dem Vocoder sehr ähnlich (beide: alle Obertöne, flach); das Rechteck
-// unterscheidet sich hörbar (nur ungerade Obertöne -> "hohl").
-constexpr float kWavePreEmphasis   = 0.9f;
-constexpr float kWaveRefHz         = 110.0f;
-constexpr float kSawLevelAtRef     = 4.00f;  // Simulation: Abgleich auf Rauschen, Bänder 4..7
-constexpr float kSquareLevelAtRef  = 2.18f;  // war 2.81 - Messung: im Formantbereich ~1.29x zu laut, danach ±1 dB
-
-q16 g_wavePreEmphasisQ16 = 0;
-q16 g_sawPrev = 0;      // letzter Rohwert für die Höhenanhebung
-q16 g_squarePrev = 0;
-
-
-// --- Kompressor-Parameter (siehe DEVLOG Nachtrag 12 für die
-// Herleitung) - Werte sind hier NEU zu kalibrieren: erst für die
-// 1-Band-Talkbox angepasst, jetzt durch die 3-Band-Summierung
-// (Nachtrag 44) wieder eine andere Signal-Skala als beim
-// 12-Band-Vocoder. Erster Schätzwert, kein gemessenes Optimum. ---
-// Gain-Struktur und Kompressor nach VocoderAnalysisNode.tsx /
-// VocoderSynthNode.tsx:
-//   Hüllkurve x100 (ANALYSIS_GAIN_BOOST) -> VCA pro Band -> Summe
-//   -> x10 (SYNTH_FIXED_LEVEL) -> Tone.Compressor(threshold -35 dB,
-//   ratio 8, attack 5 ms, release 150 ms) -> Makeup x6.
-// Der Kompressor rechnet jetzt wie Tone.js in dB (vorher linear:
-// "Schwelle + Überschuss/Ratio", das komprimiert große Pegel viel zu
-// schwach). Verstärkung wird alle kCompGainUpdateSamples Samples per
-// powf neu berechnet (ROM-Float des RP2040), dazwischen gehalten.
-// Nicht nachgebaut: Soft-Knee und die automatische Makeup-Verstärkung
-// des Web-Audio-DynamicsCompressor - kCompMakeup ggf. nach Gehör.
-constexpr int   kAnalysisGainBoost = 100;   // ANALYSIS_GAIN_BOOST
-constexpr float kCompInputGain  = 0.2f;     // Referenz: 10 - Hardware-Pegel liegt ~30 dB über dem Browser (Reduktion war -55 dB statt ~-20)
-constexpr float kCompThresholdDb = -35.0f;  // war 0.3 linear (~-10 dB)
-constexpr float kCompRatio      = 8.0f;
-constexpr float kCompAttackMs   = 5.0f;
-constexpr float kCompReleaseMs  = 150.0f;
-constexpr float kCompMakeup     = 6.0f;     // war 2.0
-constexpr uint32_t kCompGainUpdateSamples = 16;
-
-q16 g_compInputGainQ16 = 0;
-float g_compThresholdLin = 0.0f;
-q16 g_compGainQ16 = 0;
-q16 g_compAttackCoeff = 0;
-q16 g_compReleaseCoeff = 0;
-q16 g_compMakeupQ16 = 0;
-q16 g_compEnvelope = 0;
-
-// --- Noise-Gate mit Hysterese (siehe DEVLOG Nachtrag 19/20/23). ---
-// Die Referenz hat KEIN Gate. Hier trotzdem nötig: Mit x100 / x10 und
-// -35 dB-Schwelle hebt der Kompressor in Sprechpausen auch den
-// Grundpegel der Bänder deutlich hörbar an (im Browser filtert
-// vermutlich die Rauschunterdrückung des Mic-Eingangs).
-// Detektor: Summe der Analyse-Hüllkurven (reines Mic-Signal,
-// unabhängig von Carrier/Gain/Kompressor - die alte Kopplung an die
-// Ausgangshüllkurve hätte durch die neue Gain-Struktur ohnehin nicht
-// mehr gepasst). Weil die Hüllkurven jetzt mit 3 ms sehr schnell sind
-// und stark rippeln, wird die Summe zusätzlich geglättet.
-// Schwellen: ERSTE SCHÄTZUNG, aus den 6-Band-Messungen hochgerechnet
-// (Stille-Spitzen ~0.03, Sprache im Mittel ~0.1-0.2) - über die
-// Diagnosezeile "gateDet" kalibrieren. Höhere Schwellen (Richtung
-// Sprach-Mittelwert) wirken wie ein Expander und schneiden leise
-// Anteile zwischen Silben weg - das war vermutlich ein Teil dessen,
-// was die Baseline "knackiger" klingen ließ.
-constexpr float kGateOpenThreshold  = 0.015f; // war 0.040 - Stille nach Rumpelfilter max. ~0.001, "fff" ~0.03
-constexpr float kGateCloseThreshold = 0.008f; // war 0.020 - weiterhin ~8x über den Stille-Spitzen
-constexpr float kGateDetAttackMs    = 5.0f;
-constexpr float kGateDetReleaseMs   = 50.0f;
-constexpr float kGateAttackMs   = 5.0f;
-constexpr float kGateReleaseMs  = 40.0f;
-
-q16 g_gateDetAttackCoeff = 0;
-q16 g_gateDetReleaseCoeff = 0;
-q16 g_gateDetector = 0;
-q16 g_gateOpenThresholdQ16 = 0;
-q16 g_gateCloseThresholdQ16 = 0;
-q16 g_gateAttackCoeff = 0;
-q16 g_gateReleaseCoeff = 0;
-q16 g_gateGain = 0;
-bool g_gateIsOpen = false;
-
-// Digitales Tiefpassfilter direkt am Ausgang, NACH Gate/Kompressor,
-// VOR der int16-Wandlung - dämpft die scharfen oberen Harmonischen
-// des schmalen Pulszug-Carriers (20% Duty-Cycle), die bei hohen
-// Tonhöhen (nahe kMaxCarrierHz) als unangenehm hochfrequent/schrill
-// auffielen (siehe DEVLOG). Bewusst SOFTWARE statt einer zusätzlichen
-// Schaltung - reines Klangformungs-Problem, keine Rückwirkung auf die
-// erst kürzlich stabilisierte Mic-/Gate-/Kompressor-Kette, und ohne
-// das Risiko eines weiteren wackligen Steckbrett-Bauteils.
-// kOutputLowpassFreqHz ist ein erster Schätzwert (dämpft grob ab dem
-// Bereich, wo das Ohr am empfindlichsten auf "schrill" reagiert),
-// kein gemessenes/gehörtes Optimum - nach Gehör nachjustieren.
-constexpr float kOutputLowpassFreqHz = 3000.0f;
-// DIAGNOSE-SCHALTER: false = Tiefpass komplett umgehen, um zu testen,
-// ob er die Ursache für das beobachtete "Gate bleibt hängen" ist
-// (Verdacht auf verstärkte DAC->Mic-Rückkopplung, siehe DEVLOG).
-constexpr bool kOutputLowpassEnabled = false;
-q16 g_outputLowpassCoeff = 0;
-q16 g_outputLowpassState = 0;
-
-
-// =====================================================================
-// STIMMHAFT/STIMMLOS (Nachbau von modular-synth VoicedUnvoicedNode.tsx,
-// vgl. Doepfer A-129/5):
-//   Mic -> High-Shelf +6 dB @ 2 kHz ("trebleBoost", Default 6) -> das
-//   ist zugleich das Modulatorsignal für die Analyse (Pre-Emphasis).
-//   Erkennung: Hochpass- und Tiefpass-Pegel bei 1.5 kHz (Tone.Filter,
-//   Q-Default 1 dB), je Tone.Follower(0.015) = Tiefpass 66.7 Hz
-//   (tau 2.4 ms). Hochpass-Pegel > Tiefpass-Pegel -> stimmlos (hart 0/1),
-//   geglättet mit Tone.Follower(0.01) (tau 1.6 ms) gegen Klicks.
-//   Carrier: gleichstarke Überblendung (Tone.CrossFade) zwischen
-//   Sägezahn (stimmhaft) und weißem Rauschen (stimmlos, Tone.Noise).
-// Läuft auf Core0 VOR dem Start der Bänder, weil Analyse (Pre-Emphasis)
-// und Synthese (Carrier) beider Kerne davon abhängen.
-// =====================================================================
-// Rumpelfilter (Hochpass 80 Hz, Butterworth) VOR allem anderen: Bei
-// leisen Lauten (sch, f) schwankte der Mic-Pegel tieffrequent stark
-// (Atem/Luftstrom aufs Mic, micDc -0.09..-0.22) - das landete voll im
-// 1.5-kHz-Tiefpass der Erkennung und überstimmte den leisen Hochton-
-// anteil (sch: 0-16% stimmlos trotz Energie fast nur > 2 kHz). Im
-// Browser entfernt der Mic-Eingang solches Rumpeln. Keine Sprach-
-// information unter 80 Hz.
-constexpr float kRumbleHighpassHz   = 80.0f;
-constexpr float kButterworthQDb     = -3.0103f; // Q = 0.7071 linear, Web-Audio-Q in dB
-constexpr float kTrebleBoostDb      = 6.0f;    // trebleBoost-Default der Referenz
-constexpr float kTrebleShelfHz      = 2000.0f;
-constexpr float kVuvSwitchHz        = 1500.0f; // SWITCH_FREQUENCY
-constexpr float kVuvFilterQDb       = 1.0f;    // Tone.Filter-Default (Web Audio: Q in dB)
-constexpr float kVuvDetectorSmoothingS = 0.015f; // DETECTOR_SMOOTHING
-constexpr float kVuvSwitchSmoothingS   = 0.01f;  // SWITCH_SMOOTHING
-// Pegel des Rauschens im stimmlosen Fall. Die Referenz nutzt Tone.Noise
-// (weiß, etwa ±1). next_noise_q16() liefert ±0.5 -> x2. Nach Gehör bzw.
-// über outAvg bei "sss" nachjustieren.
-constexpr float kUnvoicedNoiseGain  = 2.0f;
-// Stimmhafter Carrier: Impulszug (historischer Vocoder-Carrier) statt
-// Sägezahn. Ein Impuls der Höhe h pro Periode hat dieselbe Leistung pro
-// Hz wie weißes Rauschen mit Standardabweichung sigma, wenn
-//   h = sigma * sqrt(fs / f0)
-// (sigma = 1/sqrt(3) für gleichverteiltes Rauschen ±1). Dadurch kommen
-// Vokale und Zischlaute über dieselbe Bandgewichtung gleich laut heraus,
-// unabhängig von der Tonhöhe. Simulation: Abweichung pro Band < 1 dB.
-// kVoicedLevel: manueller Feinabgleich Vokale gegen Zischlaute.
-constexpr float kVoicedLevel = 1.0f;
-
-BiquadGeneralFixed g_rumbleHighpass;
-BiquadGeneralFixed g_trebleShelf;
-BiquadGeneralFixed g_vuvHighpass;
-BiquadGeneralFixed g_vuvLowpass;
-q16 g_vuvDetectorCoeff = 0;  // 1 - exp(-1/(tau*fs))
-q16 g_vuvSwitchCoeff = 0;
-q24 g_vuvHighEnv = 0;
-q24 g_vuvLowEnv = 0;
-q16 g_vuvFade = 0;           // 0 = stimmhaft (Sägezahn), 1 = stimmlos (Rauschen)
-q16 g_unvoicedNoiseGainQ16 = 0;
-
-// Gleichstarke Überblendung wie Tone.CrossFade: a*cos(f*pi/2) + b*sin(f*pi/2).
-constexpr int kFadeTableSize = 256;
-q16 g_fadeCos[kFadeTableSize + 1];
-q16 g_fadeSin[kFadeTableSize + 1];
-
-void setup_voiced_unvoiced() {
-    const float fs = (float)kSampleRateHz;
-    g_rumbleHighpass.setHighpass(kRumbleHighpassHz, kButterworthQDb, fs);
-    g_trebleShelf.setHighShelf(kTrebleShelfHz, kTrebleBoostDb, fs);
-    g_vuvHighpass.setHighpass(kVuvSwitchHz, kVuvFilterQDb, fs);
-    g_vuvLowpass.setLowpass(kVuvSwitchHz, kVuvFilterQDb, fs);
-    // Tone.Follower(s) = einpoliger Tiefpass mit Grenzfrequenz 1/s,
-    // also Zeitkonstante tau = s / (2*pi).
-    float tauDet = kVuvDetectorSmoothingS / (2.0f * (float)M_PI);
-    float tauSw  = kVuvSwitchSmoothingS / (2.0f * (float)M_PI);
-    g_vuvDetectorCoeff = kQ16One - float_to_q16(expf(-1.0f / (tauDet * fs)));
-    g_vuvSwitchCoeff   = kQ16One - float_to_q16(expf(-1.0f / (tauSw * fs)));
-    g_unvoicedNoiseGainQ16 = float_to_q16(kUnvoicedNoiseGain);
-    for (int k = 0; k <= kFadeTableSize; ++k) {
-        float a = (float)k / (float)kFadeTableSize * (float)M_PI * 0.5f;
-        g_fadeCos[k] = float_to_q16(cosf(a));
-        g_fadeSin[k] = float_to_q16(sinf(a));
-    }
-}
+// Signalverarbeitungs-Module (Zustand; Parameter in den jeweiligen .cpp).
+CarrierGenerator g_carrier;
+VoicedUnvoiced g_vuv;
+Compressor g_comp;
+NoiseGate g_gate;
+OutputLowpass g_outLowpass;
 
 // =====================================================================
 // ZWEITER KERN (siehe DEVLOG, Kapitel 5 im Artikel: gleiches Muster wie
@@ -469,7 +229,7 @@ void core1_entry() {
 }
 
 void audioTask(void *) {
-    build_carrier_table();
+    g_carrier.init();
     // Geometrische Verteilung exakt wie in vocoderBands.ts
     // (vocoderBandFrequencies()) - t=i/(N-1), freq = FREQ_MIN *
     // (FREQ_MAX/FREQ_MIN)^t. Attack/Release-Staffelung (tief=träger,
@@ -490,10 +250,7 @@ void audioTask(void *) {
         float freq = kBandFreqLowHz * powf(kBandFreqHighHz / kBandFreqLowHz, t);
         bands[b].synthesisFilter.setBandpass(freq, kSynthesisQ, (float)kSampleRateHz);
     }
-    g_carrierNoiseMixQ16 = float_to_q16(kCarrierNoiseMix);
-    setup_voiced_unvoiced();
-    g_wavePreEmphasisQ16 = float_to_q16(kWavePreEmphasis);
-    g_noiseShapeCoeff = float_to_q16(1.0f - expf(-2.0f * (float)M_PI * kNoiseShapeFreqHz / (float)kSampleRateHz));
+    g_vuv.init();
     for (int b = 0; b < kNumBands; ++b) {
         // Referenz-Boost x100 hier mit eingerechnet (VCA-Verstärkung).
         float t = (kNumBands == 1) ? 0.0f : (float)b / (float)(kNumBands - 1);
@@ -502,19 +259,9 @@ void audioTask(void *) {
         g_bandOutputGainQ16[b] = float_to_q16(kBandOutputGain[b] * tilt * (float)kAnalysisGainBoost);
     }
 
-    g_compInputGainQ16 = float_to_q16(kCompInputGain);
-    g_compThresholdLin = powf(10.0f, kCompThresholdDb / 20.0f);
-    g_compGainQ16 = kQ16One;
-    g_compAttackCoeff = float_to_q16(expf(-1.0f / (0.001f * kCompAttackMs * (float)kSampleRateHz)));
-    g_compReleaseCoeff = float_to_q16(expf(-1.0f / (0.001f * kCompReleaseMs * (float)kSampleRateHz)));
-    g_compMakeupQ16 = float_to_q16(kCompMakeup);
-    g_gateDetAttackCoeff = float_to_q16(expf(-1.0f / (0.001f * kGateDetAttackMs * (float)kSampleRateHz)));
-    g_gateDetReleaseCoeff = float_to_q16(expf(-1.0f / (0.001f * kGateDetReleaseMs * (float)kSampleRateHz)));
-    g_gateOpenThresholdQ16 = float_to_q16(kGateOpenThreshold);
-    g_gateCloseThresholdQ16 = float_to_q16(kGateCloseThreshold);
-    g_gateAttackCoeff = float_to_q16(expf(-1.0f / (0.001f * kGateAttackMs * (float)kSampleRateHz)));
-    g_gateReleaseCoeff = float_to_q16(expf(-1.0f / (0.001f * kGateReleaseMs * (float)kSampleRateHz)));
-    g_outputLowpassCoeff = float_to_q16(1.0f - expf(-2.0f * (float)M_PI * kOutputLowpassFreqHz / (float)kSampleRateHz));
+    g_comp.init();
+    g_gate.init();
+    g_outLowpass.init();
 
     // Reihenfolge wichtig: setup_audio() belegt DMA-Kanal 0 und pio0 für
     // den DAC, setup_mic() holt sich danach freie Ressourcen (pio1,
@@ -530,7 +277,6 @@ void audioTask(void *) {
     // Ein Puffer Mic-Samples pro Ausgabepuffer, vor der Sample-Schleife
     // komplett aus dem Ring geholt.
 
-    uint32_t phase = 0;
     float carrierHz = 220.0f;
 
     // --- Diagnose-Zustand (persistiert über Puffergrenzen hinweg) ---
@@ -569,7 +315,6 @@ void audioTask(void *) {
     static uint64_t sCore1ExtraWaitSumUs = 0;
     static int64_t sGateDetSum = 0;
     static q16 sGateDetMaxQ16 = 0;
-    static q16 sCompGainMinQ16 = kQ16One; // stärkste Kompression im Fenster
     static int sLastPotPermille = 0;
     static int sLastCarrierHzInt = 0;
     static int sLastGateEnvPermille = 0;
@@ -595,7 +340,6 @@ void audioTask(void *) {
         static uint8_t sPrevWave = kWaveImpulse;
         sPrevWave = sWave;
         xQueueReceive(g_waveQueue, &sWave, 0);
-        uint32_t phaseInc = (uint32_t)((carrierHz * kCarrierTableSize / (float)kSampleRateHz) * 65536.0f);
 
         uint64_t waitStartUs = time_us_64();
         audio_buffer_t *buf = take_audio_buffer(pool, true);
@@ -617,81 +361,22 @@ void audioTask(void *) {
         // 1) Carrier-Block für den ganzen Puffer vorbereiten (Phase,
         //    Rausch-Formung - zustandsbehaftet, darum nur auf Core0).
         uint64_t prepStartUs = time_us_64();
-        // Impulshöhe für gleiche Leistungsdichte wie das Rauschen (s.o.).
-        q16 impulseHeightQ16 = float_to_q16(kVoicedLevel * (1.0f / sqrtf(3.0f)) *
-                                            sqrtf((float)kSampleRateHz / carrierHz));
-        // Pegel von Sägezahn/Rechteck: Abgleich auf das Rauschen (s.o.),
-        // Tonhöhenabhängigkeit sqrt(f_ref / f0).
-        float pitchScale = sqrtf(kWaveRefHz / carrierHz);
-        q16 sawLevelQ16    = float_to_q16(kVoicedLevel * kSawLevelAtRef * pitchScale);
-        q16 squareLevelQ16 = float_to_q16(kVoicedLevel * kSquareLevelAtRef * pitchScale);
-        // Stimmhafter Carrier für eine bestimmte Wellenform (Rohwerte und
-        // Höhenanhebung werden unten pro Sample einmal berechnet).
-        auto voicedFor = [&](uint8_t w, q16 impulse, q16 sawEmph, q16 squareEmph, q16 noiseWhite) -> q16 {
-            switch (w) {
-                case kWaveSaw:    return q16_mul(sawEmph, sawLevelQ16);
-                case kWaveSquare: return q16_mul(squareEmph, squareLevelQ16);
-                case kWaveNoise:  return noiseWhite;
-                default:          return impulse;
-            }
-        };
-        const bool waveChanged = (sWave != sPrevWave);
+        g_carrier.begin_buffer(carrierHz, sWave, sPrevWave);
         for (uint32_t i = 0; i < kBufferSamples; ++i) {
             q16 micQ16 = sMicBlock[i];
             if (micQ16 < sMicMinQ16) sMicMinQ16 = micQ16;
             if (micQ16 > sMicMaxQ16) sMicMaxQ16 = micQ16;
 
-            // Pre-Emphasis (trebleBoost): ab hier ist das der Modulator
-            // für die Analyse auf beiden Kernen.
-            q24 deRumbled = g_rumbleHighpass.processQ24(micQ16 << (kQ24Frac - kQ16Frac));
-            q24 speech = g_trebleShelf.processQ24(deRumbled);
-            sMicBlock[i] = speech >> (kQ24Frac - kQ16Frac);
+            // Rumpelfilter + Höhenanhebung: ab hier ist das der Modulator
+            // für die Analyse auf beiden Kernen. Dazu Stimmhaft/Stimmlos.
+            bool isUnvoiced;
+            sMicBlock[i] = g_vuv.process(micQ16, isUnvoiced);
+            if (isUnvoiced) ++sUnvoicedSamples;
 
-            // Erkennung: Hochpass- gegen Tiefpass-Pegel bei 1.5 kHz.
-            q24 hp = g_vuvHighpass.processQ24(speech);
-            q24 lp = g_vuvLowpass.processQ24(speech);
-            q24 hpAbs = (hp < 0) ? -hp : hp;
-            q24 lpAbs = (lp < 0) ? -lp : lp;
-            g_vuvHighEnv += (q24)(((int64_t)g_vuvDetectorCoeff * (hpAbs - g_vuvHighEnv)) >> kQ16Frac);
-            g_vuvLowEnv  += (q24)(((int64_t)g_vuvDetectorCoeff * (lpAbs - g_vuvLowEnv)) >> kQ16Frac);
-            q16 unvoiced = (g_vuvHighEnv > g_vuvLowEnv) ? kQ16One : 0;  // GreaterThan(0)
-            g_vuvFade += q16_mul(g_vuvSwitchCoeff, unvoiced - g_vuvFade);
-            if (unvoiced) ++sUnvoicedSamples;
-
-            // Carrier: Sägezahn (stimmhaft) <-> weißes Rauschen (stimmlos).
-            // Impulszug: ein Impuls bei jedem Phasenüberlauf, sonst 0.
-            uint32_t idxNow  = (phase >> 16) & (kCarrierTableSize - 1);
-            uint32_t idxNext = ((phase + phaseInc) >> 16) & (kCarrierTableSize - 1);
-            q16 impulseQ16 = (idxNext < idxNow) ? impulseHeightQ16 : 0;
-            q16 noiseQ16 = next_noise_q16();
-            q16 unvoicedQ16 = q16_mul(noiseQ16, g_unvoicedNoiseGainQ16);
-
-            // Sägezahn und Rechteck aus derselben Phase, jeweils mit
-            // Höhenanhebung y = x - a*x[n-1]. Beide laufen immer mit, damit
-            // ihr Filterzustand beim Umschalten stimmt.
-            q16 sawRaw = carrierTable[idxNow];
-            q16 squareRaw = (idxNow < (uint32_t)(kCarrierTableSize / 2)) ? kQ16One : -kQ16One;
-            q16 sawEmph = sawRaw - q16_mul(g_wavePreEmphasisQ16, g_sawPrev);
-            q16 squareEmph = squareRaw - q16_mul(g_wavePreEmphasisQ16, g_squarePrev);
-            g_sawPrev = sawRaw;
-            g_squarePrev = squareRaw;
-
-            q16 voicedQ16 = voicedFor(sWave, impulseQ16, sawEmph, squareEmph, unvoicedQ16);
-            if (waveChanged) {
-                // Lineare Überblendung über diesen einen Puffer (~11.6 ms).
-                q16 voicedOld = voicedFor(sPrevWave, impulseQ16, sawEmph, squareEmph, unvoicedQ16);
-                q16 t = (q16)(((int64_t)i << kQ16Frac) / kBufferSamples);
-                voicedQ16 = voicedOld + q16_mul(t, voicedQ16 - voicedOld);
-            }
-            // Alter fester Rauschanteil (kCarrierNoiseMix, jetzt 0) bleibt
-            // als Pfad erhalten, damit er sich zum Vergleich zuschalten lässt.
-            g_noiseShapeState = g_noiseShapeState + q16_mul(g_noiseShapeCoeff, noiseQ16 - g_noiseShapeState);
-            voicedQ16 = voicedQ16 + q16_mul(g_carrierNoiseMixQ16, g_noiseShapeState - voicedQ16);
-            int fadeIdx = (int)(((int64_t)g_vuvFade * kFadeTableSize) >> kQ16Frac);
-            if (fadeIdx < 0) fadeIdx = 0;
-            if (fadeIdx > kFadeTableSize) fadeIdx = kFadeTableSize;
-            g_carrierBlock[i] = q16_mul(voicedQ16, g_fadeCos[fadeIdx]) + q16_mul(unvoicedQ16, g_fadeSin[fadeIdx]);
-            phase += phaseInc;
+            // Carrier: stimmhaft (gewählte Wellenform) <-> Rauschen.
+            q16 voicedQ16, unvoicedQ16;
+            g_carrier.next(i, voicedQ16, unvoicedQ16);
+            g_carrierBlock[i] = g_vuv.crossfade(voicedQ16, unvoicedQ16);
         }
         sPrepSumUs += (uint32_t)(time_us_64() - prepStartUs);
 
@@ -711,52 +396,13 @@ void audioTask(void *) {
         for (uint32_t i = 0; i < kBufferSamples; ++i) {
             q16 mixed = g_mixPart[0][i] + g_mixPart[1][i];
             q16 gateDetRaw = g_gateDetPart[0][i] + g_gateDetPart[1][i];
-            q16 gateDetCoeff = (gateDetRaw > g_gateDetector) ? g_gateDetAttackCoeff : g_gateDetReleaseCoeff;
-            g_gateDetector = g_gateDetector + q16_mul(kQ16One - gateDetCoeff, gateDetRaw - g_gateDetector);
-            if (g_gateDetector > sGateDetMaxQ16) sGateDetMaxQ16 = g_gateDetector;
-            sGateDetSum += g_gateDetector;
+            q16 gateDetector = g_gate.update_detector(gateDetRaw);
+            if (gateDetector > sGateDetMaxQ16) sGateDetMaxQ16 = gateDetector;
+            sGateDetSum += gateDetector;
 
-            // Level -> Kompressor -> Makeup statt hartem Clipping.
-            mixed = q16_mul(mixed, g_compInputGainQ16);
-            // Schutz gegen int32-Überlauf bei extremen Pegeln (Plosiv
-            // direkt ins Mic) - weit über allem, was Sprache erreicht.
-            constexpr q16 kMixedLimit = 16384 * kQ16One;
-            if (mixed > kMixedLimit) mixed = kMixedLimit;
-            if (mixed < -kMixedLimit) mixed = -kMixedLimit;
-            q16 absMixed = (mixed < 0) ? -mixed : mixed;
-            q16 compCoeff = (absMixed > g_compEnvelope) ? g_compAttackCoeff : g_compReleaseCoeff;
-            g_compEnvelope = g_compEnvelope + q16_mul(kQ16One - compCoeff, absMixed - g_compEnvelope);
-            // dB-Kompressor (wie Tone.js): über der Schwelle wird der
-            // Pegelüberschuss in dB durch die Ratio geteilt:
-            //   gain = (env / thr)^(1/ratio - 1)
-            if ((i % kCompGainUpdateSamples) == 0) {
-                float envLin = (float)g_compEnvelope / (float)kQ16One;
-                float gain = 1.0f;
-                if (envLin > g_compThresholdLin) {
-                    gain = powf(envLin / g_compThresholdLin, 1.0f / kCompRatio - 1.0f);
-                }
-                g_compGainQ16 = float_to_q16(gain);
-                if (g_compGainQ16 < sCompGainMinQ16) sCompGainMinQ16 = g_compGainQ16;
-            }
-            mixed = q16_mul(mixed, g_compGainQ16);
-            mixed = q16_mul(mixed, g_compMakeupQ16);
-
-            // Noise-Gate mit Hysterese (Schmitt-Trigger-Muster).
-            q16 gateThreshold = g_gateIsOpen ? g_gateCloseThresholdQ16 : g_gateOpenThresholdQ16;
-            bool gateShouldBeOpen = (g_gateDetector > gateThreshold);
-            g_gateIsOpen = gateShouldBeOpen;
-            q16 gateTarget = gateShouldBeOpen ? kQ16One : 0;
-            q16 gateCoeff = (gateTarget > g_gateGain) ? g_gateAttackCoeff : g_gateReleaseCoeff;
-            g_gateGain = g_gateGain + q16_mul(kQ16One - gateCoeff, gateTarget - g_gateGain);
-            mixed = q16_mul(mixed, g_gateGain);
-
-            // Ausgangs-Tiefpass gegen die scharfen Carrier-Obertöne
-            // bei hohen Tonhöhen, siehe Erklärung oben.
-            if (kOutputLowpassEnabled) {
-                g_outputLowpassState = g_outputLowpassState +
-                    q16_mul(g_outputLowpassCoeff, mixed - g_outputLowpassState);
-                mixed = g_outputLowpassState;
-            }
+            mixed = g_comp.process(mixed, i);   // Level -> Kompressor -> Makeup
+            mixed = g_gate.apply(mixed);        // Noise-Gate mit Hysterese
+            mixed = g_outLowpass.process(mixed);
 
             if (mixed > kQ16One) mixed = kQ16One;
             if (mixed < -kQ16One) mixed = -kQ16One;
@@ -775,8 +421,8 @@ void audioTask(void *) {
         uint64_t elapsedUs = time_us_64() - loopStartUs;
         sSumUs += elapsedUs;
         if ((uint32_t)elapsedUs > sMaxUs) sMaxUs = (uint32_t)elapsedUs;
-        sLastGateEnvPermille = (int)(((int64_t)g_compEnvelope * 1000) / kQ16One);
-        sLastGateGainPermille = (int)(((int64_t)g_gateGain * 1000) / kQ16One);
+        sLastGateEnvPermille = (int)(((int64_t)g_comp.envelope * 1000) / kQ16One);
+        sLastGateGainPermille = (int)(((int64_t)g_gate.gain * 1000) / kQ16One);
         sLastMicDcPermille = (int)(((int64_t)mic_dc_level() * 1000) / kQ16One);
         sLastMicFill = mic_fill();
 
@@ -807,7 +453,7 @@ void audioTask(void *) {
                    kCore1FirstBand, kNumBands - 1);
             {
                 const int64_t kSamplesInWin = (int64_t)sBufferCount * kBufferSamples;
-                float compMinGain = (float)sCompGainMinQ16 / (float)kQ16One;
+                float compMinGain = (float)g_comp.minGainSeen / (float)kQ16One;
                 int compMinDb = (compMinGain > 0.0f) ? (int)(20.0f * log10f(compMinGain)) : -999;
                 printf("  gateDet: avg=%d max=%d (x/10000, open=%d close=%d)  comp: maxReduktion=%ddB\n",
                        (int)((sGateDetSum * 10000) / ((int64_t)kQ16One * kSamplesInWin)),
@@ -854,7 +500,7 @@ void audioTask(void *) {
             sCore1ExtraWaitSumUs = 0;
             sGateDetSum = 0;
             sGateDetMaxQ16 = 0;
-            sCompGainMinQ16 = kQ16One;
+            g_comp.minGainSeen = kQ16One;
         }
 
         // WICHTIG - PRIORITY-STARVATION-FIX (siehe DEVLOG Nachtrag 8):
