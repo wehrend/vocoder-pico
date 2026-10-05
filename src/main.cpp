@@ -90,8 +90,6 @@
 #include "pico/stdlib.h"
 #include "pico/audio_i2s.h"
 #include "pico/time.h"
-#include "hardware/sync.h"
-#include "pico/multicore.h"
 #include "config.h"
 #include "mic_input.h"
 #include "audio_output.h"
@@ -100,54 +98,15 @@
 #include "carrier.h"
 #include "voiced_unvoiced.h"
 #include "dynamics.h"
+#include "filterbank.h"
+#include "dual_core.h"
 #include "fixed_point.h"
 #include "biquad_fixed.h"
-#include "vocoder_band_fixed.h"
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 
 namespace {
-
-VocoderBandFixed bands[kNumBands];
-
-// Ausgangsseitige Gewichtung pro Band, NACH der Synthese, VOR der
-// Summierung - kompensiert den natürlichen Spektralabfall menschlicher
-// Sprache (Stimmquelle fällt mit steigender Frequenz stark ab,
-// unabhängig vom Vokal). Ohne das dominiert Band 0 die Summe um
-// Faktor ~5 gegenüber dem höchsten Band, bei JEDEM Vokal gleichermaßen
-// (siehe DEVLOG Nachtrag 51) - dadurch gehen die eigentlich
-// vorhandenen, vokalabhängigen RELATIVEN Verschiebungen zwischen den
-// Bändern im Summensignal akustisch unter. Werte grob am beobachteten
-// ~5x-Gefälle über 6 Bänder kalibriert - erster Schätzwert, kein
-// gemessenes Optimum.
-// TESTWEISE neutralisiert (war {1.0, 1.4, 2.0, 2.7, 3.7, 5.0}), siehe
-// DEVLOG Nachtrag 56: kalibriert für die ANALYSE-Seite (Sprache hat
-// natürlich mehr tieffrequente Energie), passt aber vermutlich nicht
-// zur SYNTHESE-Seite jetzt mit Rauschmix (recht gleichmäßige Energie
-// übers Spektrum) - erst den Rauschmix isoliert prüfen, dann ggf.
-// neu gewichten.
-// Bandgewichtung. Der Carrier (Impulszug stimmhaft, weißes Rauschen
-// stimmlos) hat gleiche Leistung pro Hz, in Constant-Q-Bändern also
-// +3 dB/Oktave. Ausgleich analytisch: Gewicht = sqrt(kBandTiltRefHz / f)
-// (siehe setup in audioTask). Simulation: alle Bänder dann bei ~0.09,
-// für Impulse UND Rauschen gleich. kBandOutputGain bleibt als
-// zusätzlicher, manueller Feinabgleich pro Band (Standard 1.0).
-// (Vorher: gemessene Sägezahn-Korrektur 0.45..14 - passte nur zum
-// Sägezahn und hob weißes Rauschen bei "sss" um ~+28 dB zu stark an.)
-constexpr float kBandOutputGain[kNumBands] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-constexpr float kBandTiltRefHz = 365.0f; // Band 3 behält Gewicht 1.0
-// Hüllkurven-Verstärkung der Referenz (ANALYSIS_GAIN_BOOST, x100), in
-// die Bandgewichtung eingerechnet (VCA-Verstärkung pro Band).
-constexpr int kAnalysisGainBoost = 100;
-q16 g_bandOutputGainQ16[kNumBands];
-
-// DIAGNOSE-SCHALTER: -1 = normaler Mix aller Bänder. 0..kNumBands-1 =
-// nur dieses eine Band hörbar, alle anderen stumm - testet, ob die
-// SYNTHESE-Seite selbst (Carrier gefiltert durch verschiedene Bänder)
-// überhaupt hörbar unterschiedlich klingt, unabhängig vom Mic-Signal/
-// Vokal. Siehe DEVLOG Nachtrag 53.
-constexpr int kSoloBand = -1;
 
 // Signalverarbeitungs-Module (Zustand; Parameter in den jeweiligen .cpp).
 CarrierGenerator g_carrier;
@@ -156,108 +115,17 @@ Compressor g_comp;
 NoiseGate g_gate;
 OutputLowpass g_outLowpass;
 
-// =====================================================================
-// ZWEITER KERN (siehe DEVLOG, Kapitel 5 im Artikel: gleiches Muster wie
-// damals). Core1 läuft als eigene Endlosschleife AUSSERHALB von
-// FreeRTOS und rechnet die obere Hälfte der Bänder. Zwei Handshakes pro
-// PUFFER (nicht pro Sample) über die SIO-FIFO:
-//   Core0: Mic-Block + Carrier-Block vorbereiten -> push -> eigene
-//          Bänder rechnen -> pop (warten) -> Teilsummen zusammenführen,
-//          Kompressor, Gate, Ausgabe.
-//   Core1: pop (warten) -> seine Bänder rechnen -> push.
-// Jeder Kern rechnet NUR seine eigenen Bänder (eigene Filterzustände,
-// eigene Diagnose-Einträge) - es gibt keine gemeinsam beschriebenen
-// Variablen außer den getrennten Teilsummen-Arrays.
-//
-// VORAUSSETZUNG: configSUPPORT_PICO_SYNC_INTEROP = 0 in FreeRTOSConfig.h
-// (ist gesetzt). Bei 1 installiert der FreeRTOS-Port einen eigenen
-// FIFO-Interrupt auf Core0, der unsere Handshake-Nachrichten wegräumen
-// würde.
-// =====================================================================
-constexpr int kCore1FirstBand = kNumBands / 2; // Core0: 0..4, Core1: 5..9
-
-// Gemeinsame Eingangsdaten pro Puffer (von Core0 vor dem Start befüllt).
+// Puffer pro Durchlauf: Modulator (Mic, nach Höhenanhebung), Carrier,
+// und die über beide Kerne zusammengeführten Ergebnisse der Filterbank.
 q16 sMicBlock[kBufferSamples];
 q16 g_carrierBlock[kBufferSamples];
-// Getrennte Teilergebnisse pro Kern: [Kern][Sample].
-q16 g_mixPart[2][kBufferSamples];
-q16 g_gateDetPart[2][kBufferSamples];
-
-// Diagnose pro Band - jedes Band wird nur von "seinem" Kern beschrieben,
-// Core0 liest/setzt zurück, während Core1 gerade NICHT rechnet.
-q16 sBandMaxQ16[kNumBands] = {};
-int64_t sBandSum[kNumBands] = {};
-int64_t sOutSum[kNumBands] = {};
-
-// Rechnet die Bänder [firstBand, endBand) für den ganzen Puffer.
-void process_band_range(int firstBand, int endBand, int core) {
-    for (uint32_t i = 0; i < kBufferSamples; ++i) {
-        q16 micQ16 = sMicBlock[i];
-        q16 synthCarrierQ16 = g_carrierBlock[i];
-        q16 mix = 0;
-        q16 gateDet = 0;
-        for (int b = firstBand; b < endBand; ++b) {
-            bands[b].analyze(micQ16);
-            if (kSoloBand < 0 || kSoloBand == b) {
-                // VCA: Hüllkurve x (Gewichtung x Referenz-Boost) zuerst,
-                // dann mit dem gefilterten Carrier multiplizieren - so
-                // bleibt die volle Q24-Auflösung der Hüllkurve erhalten.
-                q16 vcaGain = (q16)(((int64_t)bands[b].envelopeQ24 * g_bandOutputGainQ16[b]) >> kQ24Frac);
-                q16 filteredCarrier = bands[b].synthesisFilter.process(synthCarrierQ16);
-                q16 bandOut = q16_mul(filteredCarrier, vcaGain);
-                mix += bandOut;
-                sOutSum[b] += (bandOut < 0) ? -bandOut : bandOut;
-            }
-            q16 env = bands[b].envelope;
-            if (env > sBandMaxQ16[b]) sBandMaxQ16[b] = env;
-            sBandSum[b] += env;
-            gateDet += env;
-        }
-        g_mixPart[core][i] = mix;
-        g_gateDetPart[core][i] = gateDet;
-    }
-}
-
-void core1_entry() {
-    for (;;) {
-        multicore_fifo_pop_blocking();  // Start-Signal von Core0
-        __dmb();                        // Eingangsdaten von Core0 sichtbar machen
-        process_band_range(kCore1FirstBand, kNumBands, 1);
-        __dmb();                        // Ergebnisse vor dem Fertig-Signal sichtbar machen
-        multicore_fifo_push_blocking(1);
-    }
-}
+q16 g_mixBlock[kBufferSamples];
+q16 g_gateDetBlock[kBufferSamples];
 
 void audioTask(void *) {
     g_carrier.init();
-    // Geometrische Verteilung exakt wie in vocoderBands.ts
-    // (vocoderBandFrequencies()) - t=i/(N-1), freq = FREQ_MIN *
-    // (FREQ_MAX/FREQ_MIN)^t. Attack/Release-Staffelung (tief=träger,
-    // hoch=flinker) bleibt zusätzlich erhalten (in der Referenz nicht
-    // vorhanden, da Web Audio keine Fixed-Point-Zeitkonstanten-
-    // Vorberechnung braucht - für uns weiterhin sinnvoll).
-    for (int b = 0; b < kNumBands; ++b) {
-        float t = (kNumBands == 1) ? 0.0f : (float)b / (float)(kNumBands - 1);
-        float freq = kBandFreqLowHz * powf(kBandFreqHighHz / kBandFreqLowHz, t);
-        // Symmetrische Hüllkurve wie Tone.Follower: Attack = Release.
-        bands[b].init(freq, kBandQ, kFollowerTauMs, kFollowerTauMs, (float)kSampleRateHz);
-    }
-    // Synthese-Filter separat mit breiterem Q neu konfigurieren, siehe
-    // Erklärung bei kSynthesisQ oben - dieselben Frequenzen wie oben,
-    // nur mit anderem Q.
-    for (int b = 0; b < kNumBands; ++b) {
-        float t = (kNumBands == 1) ? 0.0f : (float)b / (float)(kNumBands - 1);
-        float freq = kBandFreqLowHz * powf(kBandFreqHighHz / kBandFreqLowHz, t);
-        bands[b].synthesisFilter.setBandpass(freq, kSynthesisQ, (float)kSampleRateHz);
-    }
+    filterbank_init();
     g_vuv.init();
-    for (int b = 0; b < kNumBands; ++b) {
-        // Referenz-Boost x100 hier mit eingerechnet (VCA-Verstärkung).
-        float t = (kNumBands == 1) ? 0.0f : (float)b / (float)(kNumBands - 1);
-        float freq = kBandFreqLowHz * powf(kBandFreqHighHz / kBandFreqLowHz, t);
-        float tilt = sqrtf(kBandTiltRefHz / freq);
-        g_bandOutputGainQ16[b] = float_to_q16(kBandOutputGain[b] * tilt * (float)kAnalysisGainBoost);
-    }
 
     g_comp.init();
     g_gate.init();
@@ -270,8 +138,8 @@ void audioTask(void *) {
     setup_adc();
     setup_mic();
     // Core1 starten, bevor das Mic vorgefüllt wird (Filter sind schon
-    // initialisiert). Läuft ab hier in core1_entry() und wartet.
-    multicore_launch_core1(core1_entry);
+    // initialisiert). Läuft ab hier in dual_core.cpp und wartet.
+    dual_core_start();
     mic_prefill();
 
     // Ein Puffer Mic-Samples pro Ausgabepuffer, vor der Sample-Schleife
@@ -380,22 +248,16 @@ void audioTask(void *) {
         }
         sPrepSumUs += (uint32_t)(time_us_64() - prepStartUs);
 
-        // 2) Core1 starten (obere Bänder), Core0 rechnet parallel die unteren.
-        __dmb();
-        multicore_fifo_push_blocking(1);
-        uint64_t core0StartUs = time_us_64();
-        process_band_range(0, kCore1FirstBand, 0);
-        uint64_t core0EndUs = time_us_64();
-        multicore_fifo_pop_blocking();  // warten, bis Core1 fertig ist
-        __dmb();
-        uint64_t core1DoneUs = time_us_64();
-        sCore0BandsSumUs += (uint32_t)(core0EndUs - core0StartUs);
-        sCore1ExtraWaitSumUs += (uint32_t)(core1DoneUs - core0EndUs);
+        // 2) Filterbank auf beiden Kernen (Core0: Bänder 0..4, Core1: 5..9).
+        DualCoreTiming timing = dual_core_process(sMicBlock, g_carrierBlock,
+                                                  g_mixBlock, g_gateDetBlock);
+        sCore0BandsSumUs += timing.core0BandsUs;
+        sCore1ExtraWaitSumUs += timing.core1ExtraWaitUs;
 
-        // 3) Teilsummen zusammenführen, Kompressor, Gate, Ausgabe.
+        // 3) Kompressor, Gate, Ausgabe.
         for (uint32_t i = 0; i < kBufferSamples; ++i) {
-            q16 mixed = g_mixPart[0][i] + g_mixPart[1][i];
-            q16 gateDetRaw = g_gateDetPart[0][i] + g_gateDetPart[1][i];
+            q16 mixed = g_mixBlock[i];
+            q16 gateDetRaw = g_gateDetBlock[i];
             q16 gateDetector = g_gate.update_detector(gateDetRaw);
             if (gateDetector > sGateDetMaxQ16) sGateDetMaxQ16 = gateDetector;
             sGateDetSum += gateDetector;
@@ -463,7 +325,7 @@ void audioTask(void *) {
             }
             printf("  bands[0..%d]=", kNumBands - 1);
             for (int b = 0; b < kNumBands; ++b) {
-                int bandPermille = (int)(((int64_t)sBandMaxQ16[b] * 1000) / kQ16One);
+                int bandPermille = (int)(((int64_t)g_filterbankDiag.bandMax[b] * 1000) / kQ16One);
                 printf("%d ", bandPermille);
             }
             printf("\n");
@@ -472,12 +334,12 @@ void audioTask(void *) {
             const int64_t kSamplesInWindow = (int64_t)sBufferCount * kBufferSamples;
             printf("  outAvg[0..%d] (x/1000)=", kNumBands - 1);
             for (int b = 0; b < kNumBands; ++b) {
-                printf("%d ", (int)((sOutSum[b] * 1000) / ((int64_t)kQ16One * kSamplesInWindow)));
+                printf("%d ", (int)((g_filterbankDiag.outSum[b] * 1000) / ((int64_t)kQ16One * kSamplesInWindow)));
             }
             printf("\n");
             printf("  bandsAvg[0..%d] (x/10000)=", kNumBands - 1);
             for (int b = 0; b < kNumBands; ++b) {
-                int avgPerTenThousand = (int)((sBandSum[b] * 10000) / ((int64_t)kQ16One * kSamplesInWindow));
+                int avgPerTenThousand = (int)((g_filterbankDiag.bandSum[b] * 10000) / ((int64_t)kQ16One * kSamplesInWindow));
                 printf("%d ", avgPerTenThousand);
             }
             printf("\n");
@@ -488,11 +350,7 @@ void audioTask(void *) {
             sWaitMaxUs = 0;
             sMicMinQ16 = kQ16One;
             sMicMaxQ16 = -kQ16One;
-            for (int b = 0; b < kNumBands; ++b) {
-                sBandMaxQ16[b] = 0;
-                sBandSum[b] = 0;
-                sOutSum[b] = 0;
-            }
+            g_filterbankDiag.reset();
             sMicWaitSumUs = 0;
             sCore0BandsSumUs = 0;
             sPrepSumUs = 0;

@@ -44,6 +44,8 @@ add_executable(vocoder
     src/carrier.cpp
     src/voiced_unvoiced.cpp
     src/dynamics.cpp
+    src/filterbank.cpp
+    src/dual_core.cpp
 )
 
 # INMP441-I2S-Mikrofon: PIO-Programm des I2S-Empfängers übersetzen.
