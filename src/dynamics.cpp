@@ -17,7 +17,7 @@ namespace {
 // über dem Browser (Reduktion war -55 dB statt ~-25 dB, siehe DEVLOG).
 // Nicht nachgebaut: Soft-Knee und die automatische Makeup-Verstärkung
 // des Web-Audio-DynamicsCompressor.
-constexpr float kCompInputGain   = 0.2f;
+constexpr float kCompInputGain   = 0.4f;   // war 0.2 - mehr Kompression, leise Anteile (Konsonanten, Silbenenden) werden angehoben
 constexpr float kCompThresholdDb = -35.0f;
 constexpr float kCompRatio       = 8.0f;
 constexpr float kCompAttackMs    = 5.0f;
