@@ -4,9 +4,12 @@
 // =====================================================================
 // Core1 läuft als eigene Endlosschleife AUSSERHALB von FreeRTOS und
 // rechnet die obere Hälfte der Bänder (gleiches Muster wie Kapitel 5 im
-// Artikel). Zwei Handshakes pro PUFFER über die SIO-FIFO:
-//   Core0: push (Start) -> eigene Bänder -> pop (warten) -> zusammenführen
-//   Core1: pop (warten) -> seine Bänder -> push (fertig)
+// Artikel). Pro PUFFER zwei Phasen mit je einem Handshake über die SIO-FIFO:
+//   Analyse:  Core0 push -> eigene Analysebänder -> pop (warten)
+//   Synthese: Core0 push -> eigene Synthesebänder -> pop (warten)
+//   danach Teilergebnisse zusammenführen
+// Die Trennung ist nötig, weil beim Bändertausch ein Syntheseband die
+// Hüllkurve eines Analysebands vom anderen Kern braucht.
 // Jeder Kern rechnet NUR seine eigenen Bänder (eigene Filterzustände,
 // eigene Diagnose-Einträge).
 //
@@ -21,8 +24,8 @@
 constexpr int kCore1FirstBand = kNumBands / 2;   // Core0: 0..4, Core1: 5..9
 
 struct DualCoreTiming {
-    uint32_t core0BandsUs;     // Rechenzeit der Core0-Bänder
-    uint32_t core1ExtraWaitUs; // wie lange Core0 danach noch auf Core1 wartete
+    uint32_t core0BandsUs;     // Rechenzeit der Core0-Bänder (beide Phasen)
+    uint32_t core1ExtraWaitUs; // wie lange Core0 auf Core1 wartete (beide Phasen)
 };
 
 // Core1 starten (nach filterbank_init()). Wartet danach auf Arbeit.

@@ -31,6 +31,7 @@ void Diagnostics::buffer_done(const BufferStats &s, Compressor &comp, const Nois
     lastPotPermille = (int)(s.potNorm * 1000.0f);
     lastCarrierHz = (int)s.carrierHz;
     lastWave = s.wave;
+    lastFormantShift = s.formantShift;
     lastCompEnvPermille = (int)(((int64_t)comp.envelope * 1000) / kQ16One);
     lastGateGainPermille = (int)(((int64_t)gate.gain * 1000) / kQ16One);
     lastMicDcPermille = (int)(((int64_t)mic_dc_level() * 1000) / kQ16One);
@@ -58,7 +59,7 @@ void Diagnostics::print_and_reset(Compressor &comp) {
            (unsigned long)lastMicFill, (unsigned long)kMicTargetFill,
            (unsigned long)mic_underruns(), (unsigned long)mic_overruns(),
            (unsigned long)(micWaitSumUs / bufferCount));
-    printf("  carrier: %s\n", kWaveNames[lastWave]);
+    printf("  carrier: %s  formant=%+.2f Baender\n", kWaveNames[lastWave], (double)lastFormantShift);
     printf("  vuv: stimmlos=%lu%% prep=%luus\n",
            (unsigned long)((uint64_t)unvoicedSamples * 100 / ((uint64_t)bufferCount * kBufferSamples)),
            (unsigned long)(prepSumUs / bufferCount));

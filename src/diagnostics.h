@@ -23,6 +23,7 @@ struct BufferStats {
     float potNorm;
     float carrierHz;
     uint8_t wave;
+    float formantShift;      // Formant-Verschiebung in Bändern
 };
 
 struct Diagnostics {
@@ -67,4 +68,5 @@ private:
     int lastMicDcPermille = 0;
     uint32_t lastMicFill = 0;
     uint8_t lastWave = 0;
+    float lastFormantShift = 0.0f;
 };

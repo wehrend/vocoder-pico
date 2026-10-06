@@ -77,9 +77,21 @@ void audioTask(void *) {
     static Diagnostics diag;
 
     for (;;) {
-        float potNorm = read_pot();
-        xQueueOverwrite(g_potRawQueue, &potNorm);
-        xQueueReceive(g_carrierFreqQueue, &carrierHz, 0);
+        float formantPot = read_formant_pot();
+        xQueueOverwrite(g_formantRawQueue, &formantPot);
+        // Tonhöhe: eigenes Poti nur wenn aktiviert, sonst fest.
+        float potNorm = formantPot;            // für die Diagnose ("pot=")
+        if (kPitchPotEnabled) {
+            potNorm = read_pot();
+        }
+        static float sFormantShift = 0.0f;
+        xQueueReceive(g_formantShiftQueue, &sFormantShift, 0);
+        if (kPitchPotEnabled) xQueueOverwrite(g_potRawQueue, &potNorm);
+        if (kPitchPotEnabled) {
+            xQueueReceive(g_carrierFreqQueue, &carrierHz, 0);
+        } else {
+            carrierHz = kMinCarrierHz;         // feste Tonhöhe
+        }
         // Wellenwechsel nur an Puffergrenzen übernehmen; im ersten Puffer
         // nach dem Wechsel wird von der alten zur neuen Form übergeblendet.
         static uint8_t sWave = kWaveImpulse;
@@ -121,6 +133,7 @@ void audioTask(void *) {
         uint32_t prepUs = (uint32_t)(time_us_64() - prepStartUs);
 
         // 2) Filterbank auf beiden Kernen (Core0: Bänder 0..4, Core1: 5..9).
+        filterbank_set_formant_shift(sFormantShift);   // Core1 rechnet gerade nicht
         DualCoreTiming timing = dual_core_process(sMicBlock, g_carrierBlock,
                                                   g_mixBlock, g_gateDetBlock);
 
@@ -159,6 +172,7 @@ void audioTask(void *) {
         stats.potNorm = potNorm;
         stats.carrierHz = carrierHz;
         stats.wave = sWave;
+        stats.formantShift = sFormantShift;
         diag.buffer_done(stats, g_comp, g_gate);
 
         // WICHTIG - PRIORITY-STARVATION-FIX (siehe DEVLOG Nachtrag 8):
