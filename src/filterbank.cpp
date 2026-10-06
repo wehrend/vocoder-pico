@@ -20,7 +20,7 @@ VocoderBandFixed bands[kNumBands];
 // Ausgleich analytisch: Gewicht = sqrt(kBandTiltRefHz / f). Simulation:
 // alle Bänder dann bei ~0.09, für Impulse UND Rauschen gleich.
 // kBandOutputGain bleibt als manueller Feinabgleich pro Band (1.0).
-constexpr float kBandOutputGain[kNumBands] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+constexpr float kBandOutputGain[kNumBands] = {0.3f, 0.5f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
 constexpr float kBandTiltRefHz = 365.0f;   // Band 3 behält Gewicht 1.0
 // Hüllkurven-Verstärkung der Referenz (ANALYSIS_GAIN_BOOST, x100), in
 // die Bandgewichtung eingerechnet (VCA-Verstärkung pro Band).
