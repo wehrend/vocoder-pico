@@ -9,6 +9,8 @@
 extern QueueHandle_t g_potRawQueue;      // float  audioTask -> control: Pot roh 0..1
 extern QueueHandle_t g_carrierFreqQueue; // float  control -> audioTask: geglättete Tonhöhe (Hz)
 extern QueueHandle_t g_waveQueue;        // uint8_t control -> audioTask: gewählte Wellenform
+extern QueueHandle_t g_formantRawQueue;  // float  audioTask -> control: Formant-Pot roh 0..1
+extern QueueHandle_t g_formantShiftQueue;// float  control -> audioTask: Formant-Verschiebung (Bänder)
 
 // In main() VOR dem Start der Tasks aufrufen.
 void controls_create_queues();
@@ -18,6 +20,9 @@ void setup_adc();
 
 // Pot lesen, 0..1 (ggf. invertiert, siehe kInvertPot). Nur im audioTask.
 float read_pot();
+
+// Formant-Pot (GP27) lesen, 0..1. Nur im audioTask.
+float read_formant_pot();
 
 // FreeRTOS-Task: Pot glätten/mappen, Taster entprellen, LED-Blinkcode.
 void controlTask(void *);

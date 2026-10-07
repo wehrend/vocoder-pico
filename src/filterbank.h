@@ -4,12 +4,27 @@
 // =====================================================================
 // Nachbau der Software-Referenz (modular-synth, VocoderBands.ts): Bänder,
 // Frequenzen und Q stehen in config.h, die Bandgewichtung in
-// filterbank.cpp. Die Arbeit wird pro Puffer auf zwei Kerne verteilt
-// (dual_core.h); filterbank_process() rechnet einen Bereich von Bändern.
+// filterbank.cpp.
+//
+// ZWEI PHASEN pro Puffer (für den Bändertausch, siehe DEVLOG):
+//   1. filterbank_analyze():    Analysebänder -> Hüllkurven aller Bänder
+//                               für den ganzen Puffer in einen gemeinsamen
+//                               Speicher
+//   2. filterbank_synthesize(): Synthesebänder; Band b nimmt die Hüllkurve
+//                               des ZUGEORDNETEN Analysebands (Formant-
+//                               Verschiebung)
+// Beide Phasen werden auf beide Kerne verteilt (dual_core.h); zwischen
+// den Phasen liegt ein Handshake, weil ein Syntheseband die Hüllkurve
+// eines Analysebands vom anderen Kern brauchen kann.
 
 #include <cstdint>
 #include "config.h"
 #include "fixed_point.h"
+
+// Formant-Verschiebung: Bereich in Bändern (ein Band ~0.68 Oktaven).
+// Positiv = Formanten nach oben (Stimme kleiner/heller), negativ =
+// nach unten (größer/dunkler). Zwischen ganzen Bändern wird überblendet.
+constexpr float kFormantMaxShiftBands = 3.0f;
 
 // Diagnose pro Band. Jedes Band wird nur von "seinem" Kern beschrieben;
 // lesen/zurücksetzen nur, während Core1 gerade NICHT rechnet.
@@ -31,10 +46,18 @@ extern FilterbankDiag g_filterbankDiag;
 // Bänder, Synthesefilter und Bandgewichtung einrichten.
 void filterbank_init();
 
-// Bänder [firstBand, endBand) für einen ganzen Puffer rechnen.
-//   modulator: vorverzerrtes Mic-Signal (Q16), carrier: Carrier (Q16)
-//   mixOut:    Summe der Bandausgänge dieses Bereichs pro Sample
+// Formant-Verschiebung für den nächsten Puffer setzen (in Bändern,
+// begrenzt auf ±kFormantMaxShiftBands). Nur aufrufen, während Core1
+// NICHT rechnet (vor dual_core_process).
+void filterbank_set_formant_shift(float shiftBands);
+
+// Phase 1: Analysebänder [firstBand, endBand) für den ganzen Puffer.
+//   modulator:  vorverzerrtes Mic-Signal (Q16)
 //   gateDetOut: Summe der Analyse-Hüllkurven dieses Bereichs pro Sample
-void filterbank_process(int firstBand, int endBand,
-                        const q16 *modulator, const q16 *carrier,
-                        q16 *mixOut, q16 *gateDetOut);
+void filterbank_analyze(int firstBand, int endBand,
+                        const q16 *modulator, q16 *gateDetOut);
+
+// Phase 2: Synthesebänder [firstBand, endBand) für den ganzen Puffer.
+//   carrier: Carrier (Q16); mixOut: Summe der Bandausgänge pro Sample
+void filterbank_synthesize(int firstBand, int endBand,
+                           const q16 *carrier, q16 *mixOut);

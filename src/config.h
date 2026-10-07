@@ -20,9 +20,17 @@
 
 // --- Pins ---------------------------------------------------------------
 
-// Pot (Carrier-Tonhöhe) am internen ADC. GP27/GP28 sind frei.
-constexpr uint    POT_ADC_GPIO    = 26;
-constexpr uint8_t POT_ADC_CHANNEL = 0;
+// Pots am internen ADC:
+// GP26 (Pin 31): Formant-Verschiebung (Bändertausch, Hauptmerkmal).
+// Die Carrier-Tonhöhe ist derzeit FEST (kMinCarrierHz, siehe unten). Ein
+// eigenes Tonhöhen-Poti kann später an GP27 (Pin 32): kPitchPotEnabled =
+// true setzen. GP28 ist frei.
+// Schleifer an den GPIO, Außenbeine an 3V3(OUT) und ADC-GND (Pin 33).
+constexpr uint    FORMANT_ADC_GPIO    = 26;
+constexpr uint8_t FORMANT_ADC_CHANNEL = 0;
+constexpr bool    kPitchPotEnabled    = false;
+constexpr uint    POT_ADC_GPIO        = 27;   // Tonhöhe (nur wenn kPitchPotEnabled)
+constexpr uint8_t POT_ADC_CHANNEL     = 1;
 
 // INMP441 (I2S-Mic), Verkabelung siehe wiring-diagram.svg / README.md.
 // SCK und WS MÜSSEN aufeinanderfolgende GPIOs sein (WS = SCK + 1), weil

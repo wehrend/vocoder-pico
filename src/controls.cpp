@@ -13,6 +13,7 @@
 #include "controls.h"
 #include "config.h"
 #include "carrier_wave.h"
+#include "filterbank.h"
 
 #include "pico/stdlib.h"
 #include "hardware/adc.h"
@@ -21,21 +22,41 @@
 QueueHandle_t g_potRawQueue = nullptr;
 QueueHandle_t g_carrierFreqQueue = nullptr;
 QueueHandle_t g_waveQueue = nullptr;
+QueueHandle_t g_formantRawQueue = nullptr;
+QueueHandle_t g_formantShiftQueue = nullptr;
+
+// Formant-Pot: Mitte = keine Verschiebung. In der Mittelzone (±kFormant-
+// DeadZone des Drehwegs) ist die Verschiebung exakt 0 - dann ist der
+// Klang bitgenau wie ohne Formant-Funktion. Außerhalb linear bis
+// ±kFormantMaxShiftBands an den Anschlägen.
+constexpr float kFormantDeadZone = 0.06f;
+constexpr bool  kInvertFormantPot = false;   // falls das Poti andersherum verdrahtet ist
+
+static float formant_pot_to_shift(float potNorm) {
+    float c = 2.0f * potNorm - 1.0f;                 // -1 .. +1, Mitte = 0
+    float a = (c < 0.0f) ? -c : c;
+    if (a < kFormantDeadZone) return 0.0f;
+    float scaled = (a - kFormantDeadZone) / (1.0f - kFormantDeadZone);
+    if (scaled > 1.0f) scaled = 1.0f;
+    return ((c < 0.0f) ? -scaled : scaled) * kFormantMaxShiftBands;
+}
 
 void controls_create_queues() {
     g_potRawQueue = xQueueCreate(1, sizeof(float));
     g_carrierFreqQueue = xQueueCreate(1, sizeof(float));
     g_waveQueue = xQueueCreate(1, sizeof(uint8_t));
-    if (!g_potRawQueue || !g_carrierFreqQueue || !g_waveQueue) {
+    g_formantRawQueue = xQueueCreate(1, sizeof(float));
+    g_formantShiftQueue = xQueueCreate(1, sizeof(float));
+    if (!g_potRawQueue || !g_carrierFreqQueue || !g_waveQueue ||
+        !g_formantRawQueue || !g_formantShiftQueue) {
         panic("Queue-Erstellung fehlgeschlagen (Heap zu klein?)");
     }
 }
 
 void setup_adc() {
     adc_init();
-    adc_gpio_init(POT_ADC_GPIO);
-    // Einziger ADC-Kanal ist jetzt der Pot - einmal auswählen reicht.
-    adc_select_input(POT_ADC_CHANNEL);
+    adc_gpio_init(FORMANT_ADC_GPIO);
+    if (kPitchPotEnabled) adc_gpio_init(POT_ADC_GPIO);
 }
 
 static float read_adc_normalized() {
@@ -54,13 +75,21 @@ static float read_adc_normalized() {
 constexpr bool kInvertPot = false;
 
 float read_pot() {
+    adc_select_input(POT_ADC_CHANNEL);   // zwei Pots -> Kanal vor jedem Lesen wählen
     float potNorm = read_adc_normalized();
     if (kInvertPot) potNorm = 1.0f - potNorm;
     return potNorm;
 }
 
+float read_formant_pot() {
+    adc_select_input(FORMANT_ADC_CHANNEL);
+    float v = read_adc_normalized();
+    return kInvertFormantPot ? 1.0f - v : v;
+}
+
 void controlTask(void *) {
     float smoothedHz = 220.0f;
+    float smoothedFormantPot = 0.5f;   // Mitte = keine Verschiebung
 
     // Taster (GP14, Pullup -> gedrückt = 0) und Status-LED (GP25).
     gpio_init(kWaveButtonPin);
@@ -89,6 +118,14 @@ void controlTask(void *) {
             float targetHz = kMinCarrierHz + potNorm * (kMaxCarrierHz - kMinCarrierHz);
             smoothedHz += (targetHz - smoothedHz) * 0.2f;
             xQueueOverwrite(g_carrierFreqQueue, &smoothedHz);
+        }
+
+        // --- Formant-Pot: glätten, auf Bänder abbilden ---
+        float formantRaw;
+        if (xQueueReceive(g_formantRawQueue, &formantRaw, 0) == pdTRUE) {
+            smoothedFormantPot += (formantRaw - smoothedFormantPot) * 0.2f;
+            float shift = formant_pot_to_shift(smoothedFormantPot);
+            xQueueOverwrite(g_formantShiftQueue, &shift);
         }
 
         // --- Taster ---

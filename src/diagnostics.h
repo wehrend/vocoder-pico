@@ -11,7 +11,7 @@
 #include "dual_core.h"
 #include "dynamics.h"
 
-constexpr uint32_t kDiagWindowBuffers = 100;   // ~1.16 s bei 22.05 kHz
+constexpr uint32_t kDiagWindowBuffers = 300;   // ~1.16 s bei 22.05 kHz
 
 // Werte eines einzelnen Puffers (vom audioTask befüllt).
 struct BufferStats {
@@ -23,6 +23,7 @@ struct BufferStats {
     float potNorm;
     float carrierHz;
     uint8_t wave;
+    float formantShift;      // Formant-Verschiebung in Bändern
 };
 
 struct Diagnostics {
@@ -67,4 +68,5 @@ private:
     int lastMicDcPermille = 0;
     uint32_t lastMicFill = 0;
     uint8_t lastWave = 0;
+    float lastFormantShift = 0.0f;
 };
