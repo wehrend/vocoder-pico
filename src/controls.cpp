@@ -14,10 +14,12 @@
 #include "config.h"
 #include "carrier_wave.h"
 #include "filterbank.h"
+#include "display.h"
 
 #include "pico/stdlib.h"
 #include "hardware/adc.h"
 #include <cstdio>
+#include <cmath>
 
 QueueHandle_t g_potRawQueue = nullptr;
 QueueHandle_t g_carrierFreqQueue = nullptr;
@@ -95,6 +97,7 @@ void controlTask(void *) {
     gpio_init(kWaveButtonPin);
     gpio_set_dir(kWaveButtonPin, GPIO_IN);
     gpio_pull_up(kWaveButtonPin);
+    display_init();
     gpio_init(kStatusLedPin);
     gpio_set_dir(kStatusLedPin, GPIO_OUT);
 
@@ -112,6 +115,16 @@ void controlTask(void *) {
     TickType_t blinkPhaseStart = xTaskGetTickCount();
     int blinkStep = 0;   // 0..2*(wave+1)-1: an/aus im Wechsel, danach Pause
 
+    // Anzeige: normalerweise die Formant-Verschiebung; nach einem Taster-
+    // druck (und beim Start) für kWaveOverlay die gewählte Wellenform.
+    // Aktualisiert wird nur bei Änderungen.
+    constexpr TickType_t kWaveOverlay = pdMS_TO_TICKS(1500);
+    float currentShift = 0.0f;
+    int shownShiftCenti = -100000;          // erzwingt erste Anzeige
+    bool overlayActive = true;
+    TickType_t overlayStart = xTaskGetTickCount();
+    display_show_wave(wave);
+
     for (;;) {
         float potNorm;
         if (xQueueReceive(g_potRawQueue, &potNorm, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -125,6 +138,7 @@ void controlTask(void *) {
         if (xQueueReceive(g_formantRawQueue, &formantRaw, 0) == pdTRUE) {
             smoothedFormantPot += (formantRaw - smoothedFormantPot) * 0.2f;
             float shift = formant_pot_to_shift(smoothedFormantPot);
+            currentShift = shift;
             xQueueOverwrite(g_formantShiftQueue, &shift);
         }
 
@@ -137,6 +151,9 @@ void controlTask(void *) {
                 xQueueOverwrite(g_waveQueue, &wave);
                 printf("Wellenform: %d/%d %s\n", wave + 1, (int)kWaveCount, kWaveNames[wave]);
                 blinkStep = 0;    // Blinkcode sofort neu starten
+                display_show_wave(wave);
+                overlayActive = true;
+                overlayStart = xTaskGetTickCount();
                 blinkPhaseStart = xTaskGetTickCount();
             }
         }
@@ -153,6 +170,19 @@ void controlTask(void *) {
             blinkStep = (blinkStep >= steps) ? 0 : blinkStep + 1;
         }
         gpio_put(kStatusLedPin, (blinkStep < steps) && (blinkStep % 2 == 0));
+
+        // --- Anzeige ---
+        if (overlayActive && (xTaskGetTickCount() - overlayStart >= kWaveOverlay)) {
+            overlayActive = false;
+            shownShiftCenti = -100000;      // Formant sofort wieder anzeigen
+        }
+        if (!overlayActive) {
+            int centi = (int)lroundf(currentShift * 100.0f);
+            if (centi != shownShiftCenti) {
+                display_show_formant(currentShift);
+                shownShiftCenti = centi;
+            }
+        }
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }

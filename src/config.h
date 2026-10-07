@@ -49,6 +49,12 @@ constexpr uint kMicSdPin  = 12;
 constexpr uint kWaveButtonPin = 14;
 constexpr uint kStatusLedPin  = 25;
 
+// 7-Segment-Anzeige (TM1637, 4 Stellen mit Doppelpunkt), siehe display.h.
+// VCC an 3V3(OUT) (Pin 36), NICHT 5 V (Pullups des Moduls an CLK/DIO).
+constexpr uint    kDisplayClkPin     = 20;   // Pin 26
+constexpr uint    kDisplayDioPin     = 21;   // Pin 27
+constexpr uint8_t kDisplayBrightness = 2;    // 0..7 (niedrig = weniger Strom)
+
 // --- Abtastung ------------------------------------------------------------
 
 // 22.05 kHz: 10 Bänder mit je Analyse- und Synthesefilter passen damit
