@@ -48,6 +48,7 @@ add_executable(vocoder
     src/dual_core.cpp
     src/audio_task.cpp
     src/diagnostics.cpp
+    src/display.cpp 
 )
 
 # Build-Zeitstempel für die Diagnoseausgabe: build_stamp.h wird bei JEDEM
