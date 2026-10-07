@@ -11,7 +11,7 @@
 #include "dual_core.h"
 #include "dynamics.h"
 
-constexpr uint32_t kDiagWindowBuffers = 100;   // ~1.16 s bei 22.05 kHz
+constexpr uint32_t kDiagWindowBuffers = 300;   // ~1.16 s bei 22.05 kHz
 
 // Werte eines einzelnen Puffers (vom audioTask befüllt).
 struct BufferStats {
