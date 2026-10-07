@@ -15,7 +15,7 @@ enum CarrierWave : uint8_t {
     kWaveNoise   = 3,   // nur Rauschen -> Flüsterstimme
     kWaveCount   = 4
 };
-inline const char *const kWaveNames[kWaveCount] = {"Impulszug", "Saegezahn", "Rechteck", "Rauschen"};
+inline const char *const kWaveNames[kWaveCount] = {"Pulse", "Saw", "Square", "Noise"};
 
 // KALIBRIER-SCHALTER: -1 = Wellenform per Taster wählbar (Normalbetrieb).
 // 0..3 = fest eingestellt, Taster wird ignoriert:

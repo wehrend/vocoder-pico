@@ -27,13 +27,14 @@ constexpr uint8_t kSegMinus = 0x40;
 constexpr uint8_t kSegBlank = 0x00;
 constexpr uint8_t kColon    = 0x80;
 
-// Wellenform-Namen (deutsch, 7-Segment-tauglich):
-//   PULS = Impulszug, SAgE = Sägezahn, rECt = Rechteck, rAUS = Rauschen
+// Wellenform-Namen (englisch, 7-Segment-tauglich). W und M sind auf
+// 7 Segmenten nicht darstellbar - "saw" wird als "SAuu" angedeutet.
+//   PULS = pulse, SAuu = saw, SqrE = square, nOIS = noise
 constexpr uint8_t kWaveText[kWaveCount][4] = {
     {0x73, 0x3E, 0x38, 0x6D},   // P U L S
-    {0x6D, 0x77, 0x6F, 0x79},   // S A g E
-    {0x50, 0x79, 0x39, 0x78},   // r E C t
-    {0x50, 0x77, 0x3E, 0x6D},   // r A U S
+    {0x6D, 0x77, 0x1C, 0x1C},   // S A u u
+    {0x6D, 0x67, 0x50, 0x79},   // S q r E
+    {0x54, 0x3F, 0x30, 0x6D},   // n O I S
 };
 
 inline void line_low(uint pin)     { gpio_set_dir(pin, GPIO_OUT); }   // Ausgang, Wert 0
