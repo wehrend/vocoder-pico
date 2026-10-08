@@ -40,20 +40,30 @@ constexpr uint kMicSckPin = 10;
 constexpr uint kMicWsPin  = 11;
 constexpr uint kMicSdPin  = 12;
 
-// Bedienung: Taster schaltet die Carrier-Wellenform weiter, die Onboard-
+// Bedienung: Taster 1 schaltet die Carrier-Wellenform weiter, die Onboard-
 // LED zeigt sie als Blinkcode (1x Impulszug, 2x Sägezahn, 3x Rechteck,
-// 4x Rauschen).
-// Taster: GP14 (Pin 19) gegen GND (Pin 18), interner Pullup -> gedrückt = 0.
+// 4x Rauschen). Taster 2 ist frei / reserviert für spätere Funktionen.
+// Taster: je gegen GND (Pin 18 bzw. 23), interner Pullup -> gedrückt = 0.
 // 6x6-Taster am besten DIAGONAL anschließen (Einbaurichtung dann egal).
 // LED: GP25 = Onboard-LED des Pico (NICHT beim Pico W - dort am WLAN-Chip).
-constexpr uint kWaveButtonPin = 14;
+constexpr uint kWaveButtonPin = 14;   // Taster 1 (Pin 19)
+constexpr uint kAuxButtonPin  = 15;   // Taster 2 (Pin 20), frei / reserviert
 constexpr uint kStatusLedPin  = 25;
 
-// 7-Segment-Anzeige (TM1637, 4 Stellen mit Doppelpunkt), siehe display.h.
-// VCC an 3V3(OUT) (Pin 36), NICHT 5 V (Pullups des Moduls an CLK/DIO).
-constexpr uint    kDisplayClkPin     = 20;   // Pin 26
-constexpr uint    kDisplayDioPin     = 21;   // Pin 27
-constexpr uint8_t kDisplayBrightness = 2;    // 0..7 (niedrig = weniger Strom)
+// 7-Segment-Anzeige: 4x Kingbright SC39-11GWA (gemeinsame KATHODE), direkt
+// gemultiplext, siehe display.kicad_sch.
+// Segmente A,B,C,D,E,F,G,DP = GP2..GP9 (aufeinanderfolgend, je 220 Ohm),
+// aktiv HIGH. GP0/GP1 bleiben bewusst frei (UART0 für stdio/Debug).
+// Stellen 1..4 = GP19..GP22 (aufeinanderfolgend), je über 1 kOhm an einen
+// BC547 (NPN, low-side) -> HIGH = Stelle an.
+// Segment-GPIOs mit GPIO_DRIVE_STRENGTH_12MA betreiben.
+constexpr uint    kDispSegBasePin    = 2;    // GP2..GP9  = A..G, DP
+constexpr uint    kDispNumSegPins    = 8;
+constexpr uint    kDispDigitBasePin  = 19;   // GP19..GP22 = Stelle 1..4
+constexpr uint    kDispNumDigits     = 4;
+constexpr uint8_t kDisplayBrightness = 2;    // 0..7 (Einschaltdauer pro Stelle)
+
+// Freie GPIOs: GP0, GP1 (UART0), GP13, GP28.
 
 // --- Abtastung ------------------------------------------------------------
 
